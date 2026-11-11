@@ -10,6 +10,10 @@ Usage:
         ...
 """
 
+import asyncio
+import logging
+import os
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -17,6 +21,40 @@ from firebase_admin import auth, firestore_async
 from .local_notification_test import enabled, validate_environment
 
 _bearer = HTTPBearer()
+logger = logging.getLogger(__name__)
+
+
+def _bootstrap_admin_uids() -> set[str]:
+    """Deployment-controlled break-glass identities used only for bootstrap.
+
+    Firestore role documents are intentionally not consulted here: existing
+    values may predate hardened rules and therefore are not a trustworthy
+    source for permanent administrative authority.
+    """
+    return {
+        value.strip()
+        for value in os.getenv("BOOTSTRAP_ADMIN_UIDS", "").split(",")
+        if value.strip()
+    }
+
+
+async def _decode_token(token: str, *, check_revoked: bool = False) -> dict:
+    return await asyncio.to_thread(
+        auth.verify_id_token,
+        token,
+        check_revoked=check_revoked,
+    )
+
+
+async def _admin_access_is_blocked(uid: str) -> bool:
+    """Deny a UID whose demotion started, even if an old token still says admin."""
+    snapshot = await (
+        firestore_async.client()
+        .collection("admin_access_blocks")
+        .document(uid)
+        .get()
+    )
+    return snapshot.exists and snapshot.to_dict().get("blocked") is True
 
 
 async def verify_token(
@@ -29,7 +67,7 @@ async def verify_token(
     Raises HTTP 401 on any authentication failure.
     """
     try:
-        decoded = auth.verify_id_token(credentials.credentials)
+        decoded = await _decode_token(credentials.credentials)
         return decoded["uid"]
     except Exception as exc:
         raise HTTPException(
@@ -38,29 +76,56 @@ async def verify_token(
         ) from exc
 
 
-async def verify_admin(uid: str = Depends(verify_token)) -> str:
+async def verify_admin(
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
+) -> str:
     """
-    Verify that the authenticated user has the 'admin' role in Firestore.
+    Verify administrative authority from a Firebase Auth custom claim.
     """
     try:
-        if enabled():
-            # The token was verified against the loopback Auth emulator above.
-            # This bypass exists only behind the strict local-test preflight and
-            # cannot be activated in a production environment.
-            validate_environment()
-            return uid
-        db = firestore_async.client()
-        user_doc = await db.collection("users").document(uid).get()
-        if not user_doc.exists or user_doc.to_dict().get("role") != "admin":
+        decoded = await _decode_token(
+            credentials.credentials,
+            check_revoked=not enabled(),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid, expired, or revoked Firebase ID token.",
+        ) from exc
+
+    uid = decoded["uid"]
+    if enabled():
+        # The token was verified against the loopback Auth emulator above.
+        # This bypass exists only behind the strict local-test preflight and
+        # cannot be activated in a production environment.
+        validate_environment()
+        return uid
+
+    try:
+        if await _admin_access_is_blocked(uid):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Admin privileges required.",
+                detail="Administrative access has been revoked.",
             )
-        return uid
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error verifying admin status: {exc}",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Administrative authorization is temporarily unavailable.",
         ) from exc
+
+    if decoded.get("admin") is True:
+        return uid
+    if uid in _bootstrap_admin_uids():
+        logger.warning(
+            "Bootstrap administrator access used by uid=%s; migrate this "
+            "identity to an audited custom claim and remove it from "
+            "BOOTSTRAP_ADMIN_UIDS",
+            uid,
+        )
+        return uid
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Admin privileges required.",
+    )

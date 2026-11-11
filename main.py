@@ -42,6 +42,7 @@ import uuid
 from app.firebase import init_firebase
 from app.limiter import limiter
 from app.routers import (
+    admin_users_router,
     assets_router,
     chat_router,
     notifications_router,
@@ -155,6 +156,7 @@ app.add_middleware(CorrelationIdMiddleware)
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 app.include_router(upload_router)
+app.include_router(admin_users_router)
 app.include_router(assets_router)
 app.include_router(chat_router)
 app.include_router(schedules_router)
