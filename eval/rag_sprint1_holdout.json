@@ -1,0 +1,108 @@
+[
+  {
+    "id": "T01",
+    "question": "٩ × ٨",
+    "expect": [
+      "9 × 8 = 72"
+    ],
+    "mock_answer": "",
+    "required_urls": [],
+    "verdict": "verified",
+    "max_attempts": 0,
+    "require_no_citations": true
+  },
+  {
+    "id": "T02",
+    "question": "متى آخر يوم لوقف القيد بالفصل الأول 2026/2027 في التقويم العام؟",
+    "expect": [
+      "22 أكتوبر 2026"
+    ],
+    "mock_answer": "",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/academic-calendar-0"
+    ],
+    "verdict": "verified",
+    "ban": [
+      "24 أكتوبر"
+    ]
+  },
+  {
+    "id": "T03",
+    "question": "متى الاختبارات النهائية في كلية الحقوق؟",
+    "expect": [
+      "التاريخ غير متحقق"
+    ],
+    "mock_answer": "",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/lawcalender"
+    ],
+    "verdict": "uncertainty",
+    "ban": [
+      "30 يناير",
+      "30/1/2027"
+    ]
+  },
+  {
+    "id": "T04",
+    "question": "هل Kuniv AI تابع رسمي من جامعة الكويت؟",
+    "expect": [
+      "لا أملك ما يثبت"
+    ],
+    "mock_answer": "",
+    "required_urls": [],
+    "verdict": "uncertainty",
+    "require_no_citations": true
+  },
+  {
+    "id": "T05",
+    "question": "عطني لينك تسجيل المقررات",
+    "expect": [
+      "نظام تسجيل المقررات"
+    ],
+    "mock_answer": "",
+    "required_urls": [
+      "https://portal.ku.edu.kw/sis"
+    ],
+    "verdict": "verified",
+    "max_attempts": 0
+  },
+  {
+    "id": "T06",
+    "question": "Could I clear the academic warning with a B?",
+    "expect": [
+      "cumulative GPA",
+      "credits per course"
+    ],
+    "mock_answer": "",
+    "required_urls": [
+      "https://www.ku.edu.kw/sites/default/files/2025-08/FAQAr.pdf"
+    ],
+    "verdict": "clarification"
+  },
+  {
+    "id": "T07",
+    "question": "Can you show my class schedule?",
+    "expect": [
+      "Synthetic Course"
+    ],
+    "mock_answer": "Synthetic Course is on your schedule.",
+    "required_urls": [],
+    "verdict": "verified",
+    "with_schedule": true,
+    "required_tools": [],
+    "require_no_citations": true
+  },
+  {
+    "id": "T08",
+    "question": "وين رمز الدخول إلى جيميني؟",
+    "expect": [
+      "ما قدرت أتحقق",
+      "مركز نظم المعلومات"
+    ],
+    "mock_answer": "",
+    "required_urls": [
+      "https://cis.ku.edu.kw/ar/contact-us"
+    ],
+    "verdict": "uncertainty"
+  }
+]

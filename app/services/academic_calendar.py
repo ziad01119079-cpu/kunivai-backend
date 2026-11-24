@@ -23,6 +23,8 @@ from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
+
+from .grounding import official_ku_url
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.utils import CryptographyDeprecationWarning
@@ -97,6 +99,7 @@ class CalendarQuery:
     semester: Semester
     college_scope: CollegeScope = CollegeScope.GENERAL
     college_specified: bool = False
+    audience: str | None = None
 
 
 @dataclass(frozen=True)
@@ -238,7 +241,7 @@ _EVENT_PATTERNS: tuple[tuple[CalendarEvent, tuple[str, ...]], ...] = (
     (
         CalendarEvent.COURSE_WITHDRAWAL,
         (
-            r"(?:ال|لل)انسحاب من (?:المقررات|المواد)",
+            r"(?:(?:ال|لل)?انسحاب) من (?:المقررات|المواد|المقرر|المادة)",
             r"سحب (?:ال)?(?:مقررات|مواد|مادة)",
             r"course withdrawal",
             r"withdraw(?:al)? (?:from )?(?:a )?(?:course|courses|class|classes)",
@@ -311,8 +314,9 @@ _COLLEGE_PATTERNS = {
     ),
 }
 
+_AUDIENCE = r"(?:سن[هة] اولى|السن[هة] الاولى|الفرق[هة] الاولى|المستجدين|first[ -]year|freshmen)"
 _FOLLOW_UP_MARKERS = (
-    r"(?:هذه السنة|هذي السنة|هالسنة|السنة دي|السنة الحالية)",
+    r"(?:هذه السن[هة]|هذي السن[هة]|هالسن[هة]|السن[هة] دي|السن[هة] الحالي[هة]|السنه الحاليليه)",
     r"(?:هذا الفصل|هالفصل|الفصل الحالي|الترم الحالي)",
     r"(?:this|current) (?:year|semester|term)",
     r"(?:first|second|fall|spring|summer) semester",
@@ -405,7 +409,7 @@ def _extract_academic_year(text: str) -> str | None:
 
 def _has_relative_year(text: str) -> bool:
     return bool(re.search(
-        r"(?:هذه السنة|هذي السنة|السنة دي|هالسنة|السنة الحالية|this year|current academic year)",
+        r"(?:هذه السن[هة]|هذي السن[هة]|هالسنة|السن[هة] دي|السن[هة] الحالي[هة]|السنه الحاليليه|this year|current academic year)",
         text,
     ))
 
@@ -421,18 +425,41 @@ def resolve_calendar_query(
     today = today or kuwait_today()
     current = _normalize(current_message)
     event = _extract_event(current)
+    if event is None and re.search(r"(?:فا+[ي]?ن[ا]?ل|فاينلات)", current) and not re.search(r"(?:فاينلي|فاينلاتي)", current):
+        event = CalendarEvent.FINAL_EXAMS
     semester = _extract_semester(current)
     academic_year = _extract_academic_year(current)
     college = _extract_college(current)
     college_specified = college is not None
 
-    is_follow_up = any(re.search(pattern, current) for pattern in _FOLLOW_UP_MARKERS)
-    if event is None and is_follow_up:
-        for message in prior_messages_desc:
-            if message.get("isUser", True):
-                event = _extract_event(_normalize(str(message.get("content", ""))))
-                if event is not None:
+    if event is CalendarEvent.ENROLLMENT_SUSPENSION and re.search(
+        r"(?:شروط|طلبات|كيف|شلون|requirements|how (?:do|to|can))", current
+    ) and not re.search(r"(?:متى|موعد|اخر|when|deadline)", current):
+        return None
+    audience = "first_year" if re.search(_AUDIENCE, current) else None
+    is_follow_up = len(current.split()) <= 13 and any(
+        re.search(pattern, current) for pattern in _FOLLOW_UP_MARKERS
+    )
+    if event is None and re.search(r"(?:شروط|طلبات|ما هي|هل يوجد|موقع|عنوان|requirements|where)", current):
+        is_follow_up = False
+    prior_context = []
+    if is_follow_up:
+        for message in [row for row in prior_messages_desc if row.get("isUser", True)][:4]:
+            prior = _normalize(str(message.get("content", "")))
+            prior_event = _extract_event(prior)
+            if prior_event is None and re.search(r"(?:فا+[ي]?ن[ا]?ل|فاينلات)", prior):
+                prior_event = CalendarEvent.FINAL_EXAMS
+            if prior_event:
+                if event is not None and event != prior_event:
                     break
+                event = prior_event
+                prior_context.append(prior)
+                break
+            if not any(re.search(pattern, prior) for pattern in _FOLLOW_UP_MARKERS):
+                break
+            if len(prior.split()) > 13:
+                break
+            prior_context.append(prior)
     if event is None:
         return None
 
@@ -440,19 +467,15 @@ def resolve_calendar_query(
     if academic_year is None and _has_relative_year(current):
         academic_year = current_year
 
-    if is_follow_up and (academic_year is None or semester is None or college is None):
-        for message in prior_messages_desc:
-            if not message.get("isUser", True):
-                continue
-            prior = _normalize(str(message.get("content", "")))
-            if academic_year is None:
-                academic_year = _extract_academic_year(prior)
-            if semester is None:
-                semester = _extract_semester(prior)
-            if college is None:
-                college = _extract_college(prior)
-                if college is not None:
-                    college_specified = True
+    for prior in prior_context:
+        if academic_year is None:
+            academic_year = current_year if _has_relative_year(prior) else _extract_academic_year(prior)
+        semester = semester or _extract_semester(prior)
+        if college is None:
+            college = _extract_college(prior)
+            college_specified = college is not None
+        if audience is None and re.search(_AUDIENCE, prior):
+            audience = "first_year"
 
     if college is None and re.search(r"(?:كليتي|my college)", current):
         college = _college_from_schedule(schedule_college)
@@ -464,6 +487,7 @@ def resolve_calendar_query(
         semester=semester or current_semester,
         college_scope=college or CollegeScope.GENERAL,
         college_specified=college_specified,
+        audience=audience,
     )
 
 
@@ -480,12 +504,16 @@ class _VisibleTextParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs) -> None:
         if tag in {"script", "style", "noscript", "svg"}:
             self.ignored_depth += 1
+        elif tag == "tr":
+            self.parts.append("\n|calendar-row-start|\n")
         elif tag in self._BLOCK_TAGS:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style", "noscript", "svg"} and self.ignored_depth:
             self.ignored_depth -= 1
+        elif tag == "tr":
+            self.parts.append("\n|calendar-row-end|\n")
         elif tag in self._BLOCK_TAGS:
             self.parts.append("\n")
 
@@ -527,11 +555,6 @@ class _CalendarLinkParser(HTMLParser):
             self._parts = []
 
 
-def _official_ku_url(url: str) -> bool:
-    host = (urlparse(url).hostname or "").casefold()
-    return host == "ku.edu.kw" or host.endswith(".ku.edu.kw")
-
-
 def _source_scope(link_text: str, url: str) -> CollegeScope | None:
     combined = _normalize(f"{link_text} {urlparse(url).path.replace('-', ' ')}")
     path = urlparse(url).path.casefold()
@@ -564,7 +587,7 @@ def discover_special_calendar_sources(index_html: str) -> tuple[OfficialCalendar
     seen_urls: set[str] = set()
     for href, link_text in parser.links:
         url = urljoin(OFFICIAL_CALENDAR_INDEX_URL, href.strip())
-        if url == OFFICIAL_CALENDAR_INDEX_URL or not _official_ku_url(url):
+        if url == OFFICIAL_CALENDAR_INDEX_URL or not official_ku_url(url):
             continue
         if "/taxonomy/" in urlparse(url).path.casefold():
             continue
@@ -651,7 +674,7 @@ def verify_official_calendar_html(
 ) -> EvidenceResolution:
     """Verify exact event/term/scope matches against fetched page content."""
     checked_at = checked_at or kuwait_now()
-    if source.scope is not query.college_scope:
+    if not official_ku_url(source.url) or source.scope is not query.college_scope:
         return EvidenceResolution(
             "unsupported_scope", (), source, checked_at, "source scope does not match query"
         )
@@ -663,9 +686,35 @@ def verify_official_calendar_html(
         if year != query.academic_year or semester is not query.semester:
             continue
 
-        window_start = max(0, event_match.start() - 140)
-        window_end = min(len(text), event_match.end() + 140)
+        row_start = "|calendar-row-start|"
+        row_end = "|calendar-row-end|"
+        left_row = text.rfind(row_start, 0, event_match.start())
+        right_row = text.find(row_end, event_match.end())
+        in_row = left_row > text.rfind(row_end, 0, event_match.start()) and right_row >= 0
+        # Rows associate labels with their own date cells. Flat general pages
+        # place dates after their event heading; stop at the next event/term.
+        if in_row:
+            window_start, window_end = left_row + len(row_start), right_row
+        elif source.scope is CollegeScope.GENERAL:
+            window_start = event_match.start()
+            window_end = min(len(text), event_match.end() + 140)
+            boundaries = [
+                pattern
+                for _, patterns in _EVENT_PATTERNS
+                for pattern in patterns
+            ] + [r"اجاز[هة]", r"عطل[هة]", r"vacation", r"semester break",
+                 r"الفصل الدراسي", r"(?:fall|spring|summer) semester"]
+            next_event = re.search("|".join(f"(?:{p})" for p in boundaries), text[event_match.end():window_end])
+            if next_event:
+                window_end = event_match.end() + next_event.start()
+        else:
+            window_start = text.rfind("\n", 0, event_match.start()) + 1
+            window_end = text.find("\n", event_match.end())
+            if window_end < 0:
+                window_end = len(text)
         window = text[window_start:window_end]
+        if query.audience == "first_year" and not re.search(_AUDIENCE, window):
+            continue
         candidates: list[tuple[int, int, date]] = []
         for date_match in _DATE_RE.finditer(window):
             parsed = _date_from_match(date_match)
@@ -686,11 +735,12 @@ def verify_official_calendar_html(
         closest_distance = candidates[0][0]
         selected = [candidates[0][2]]
         if query.event in _RANGE_EVENTS:
-            selected = [
-                value
-                for distance, _position, value in candidates
-                if distance <= closest_distance + 45
-            ][:2]
+            selected = list(dict.fromkeys(
+                value for distance, _position, value in candidates
+                if in_row or distance <= closest_distance + 45
+            ))[:2]
+        if query.event in _RANGE_EVENTS and len(selected) < 2:
+            continue
         records.append(VerifiedCalendarRecord(
             query.event,
             query.academic_year,
@@ -799,8 +849,7 @@ async def _request_official_html(url: str, verify: bool | ssl.SSLContext) -> str
     ) as client:
         response = await client.get(url)
         response.raise_for_status()
-        final_host = (urlparse(str(response.url)).hostname or "").casefold()
-        if final_host != "ku.edu.kw" and not final_host.endswith(".ku.edu.kw"):
+        if not official_ku_url(str(response.url)):
             raise ValueError("official calendar redirected outside ku.edu.kw")
         return response.text
 
@@ -894,7 +943,7 @@ async def lookup_official_calendar(
         )
 
     general_query = CalendarQuery(
-        query.event, query.academic_year, query.semester, CollegeScope.GENERAL
+        query.event, query.academic_year, query.semester, CollegeScope.GENERAL, audience=query.audience
     )
     general = verify_official_calendar_html(
         general_query, index_html, general_source, checked_at=checked_at
@@ -918,7 +967,7 @@ async def lookup_official_calendar(
 
     async def verify_source(source: OfficialCalendarSource) -> EvidenceResolution:
         source_query = CalendarQuery(
-            query.event, query.academic_year, query.semester, source.scope, True
+            query.event, query.academic_year, query.semester, source.scope, True, query.audience
         )
         try:
             html = await _cached_official_html(

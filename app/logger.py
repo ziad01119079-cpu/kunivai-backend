@@ -19,17 +19,20 @@ class JSONFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
         
-        # Add context vars if present
-        req_id = request_id_var.get()
-        if req_id: log_obj["request_id"] = req_id
-            
-        chat_id = chat_id_var.get()
-        if chat_id: log_obj["chat_id"] = chat_id
-            
-        uid = uid_var.get()
-        if uid: log_obj["uid"] = uid
-        fence = generation_fence_var.get()
-        if fence is not None: log_obj["generation_fence"] = fence
+        # Cost events correlate through their server-generated trace ID only.
+        if not getattr(record, "cost_telemetry", False):
+            req_id = request_id_var.get()
+            if req_id:
+                log_obj["request_id"] = req_id
+            chat_id = chat_id_var.get()
+            if chat_id:
+                log_obj["chat_id"] = chat_id
+            uid = uid_var.get()
+            if uid:
+                log_obj["uid"] = uid
+            fence = generation_fence_var.get()
+            if fence is not None:
+                log_obj["generation_fence"] = fence
 
         # Add any extra operational metadata passed via `extra={"operational_metadata": {...}}`
         if hasattr(record, "operational_metadata"):

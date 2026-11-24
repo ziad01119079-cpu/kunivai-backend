@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit
 
 
 _UNIVERSITY_ID_PATTERNS = (
@@ -145,3 +146,48 @@ def sanitize_university_id_answer(
     else:
         sanitized = caveat
     return sanitized, True
+
+
+def official_ku_url(url: str) -> bool:
+    """Only canonical HTTPS Kuwait University authority qualifies."""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        return (
+            parsed.scheme == "https" and (host == "ku.edu.kw" or host.endswith(".ku.edu.kw"))
+            and parsed.username is None and parsed.password is None and parsed.port in (None, 443)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def applicable_citations(citations: list[dict], *, require_official: bool) -> list[dict]:
+    """Unauthenticated web origins cannot establish a high-risk university claim."""
+    accepted = []
+    for citation in citations:
+        url = citation.get("url")
+        if url is not None:
+            try:
+                parsed = urlsplit(url)
+                usable = parsed.scheme == "https" and bool(parsed.hostname) and parsed.username is None
+                if not usable or not official_ku_url(url) and (
+                    require_official or parsed.hostname == "ku.edu" or parsed.hostname.endswith(".ku.edu")
+                ):
+                    continue
+            except (TypeError, ValueError, AttributeError):
+                continue
+        elif require_official:
+            # Legacy File Search annotations lack independently verified publisher metadata.
+            continue
+        accepted.append(citation)
+    return accepted
+
+
+def needs_authoritative_policy(question: str) -> bool:
+    normalized = _normalize(question)
+    return bool(re.search(
+        r"حساب الطالب|نظام (?:الطالب|التسجيل)|البيانات البنكية|معلومات بنكية|الايبان|كلمة (?:السر|المرور)|"
+        r"الانذار الاكاديمي|الايقاف الاكاديمي|(?:شروط|قواعد).{0,20}التحويل|"
+        r"student (?:account|portal)|academic (?:standing|warning|probation)|bank details",
+        normalized,
+    ))

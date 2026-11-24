@@ -81,7 +81,7 @@ _PERSONAL_SCHEDULE_PATTERNS = (
     r"(?:شنو|وش|إيه|ايه) عندي (?:محاضرات|مواد|اختبارات).{0,20}(?:اليوم|باجر|بكرة|غد)",
     r"عندي (?:محاضرات|مواد|اختبارات).{0,20}(?:اليوم|باجر|بكرة|غد)",
     r"ارفع (?:جدول|الجدول)", r"رفع (?:جدول|الجدول)",
-    r"\bmy schedule\b", r"\bmy (?:courses|classes|sections|instructors|exams)\b",
+    r"\bmy (?:course |class )?schedule\b", r"\bmy (?:courses|classes|sections|instructors|exams)\b",
     r"\bmy (?:grade|level|academic level|gpa|major|minor|college|credits|academic status)\b",
     r"\bwhat(?: is|'s) my (?:grade|level|academic level|gpa|major|minor|college|credits|academic status)\b",
     r"\bschedules? i (?:uploaded|added)\b",

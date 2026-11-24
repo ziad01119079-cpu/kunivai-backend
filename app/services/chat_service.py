@@ -36,7 +36,9 @@ from ..history_builder import build_history
 from ..responses_api import stream_response
 from ..schedule_repository import load_user_schedules
 from .schedule_context import build_schedule_context
-from .grounding import missing_evidence_answer, sanitize_university_id_answer
+from .grounding import applicable_citations, missing_evidence_answer, needs_authoritative_policy, sanitize_university_id_answer
+from .provider_usage import UsageTrace, current_usage
+from .verified_answers import known_answer
 from .response_policy import response_policy_prompt
 from ..task_tracker import background_tasks
 from ..logger import chat_id_var, generation_fence_var, uid_var
@@ -148,11 +150,17 @@ async def process_chat(
         if str((schedule.get("student") or {}).get("college") or "").strip()
     }
     schedule_college = next(iter(schedule_colleges)) if len(schedule_colleges) == 1 else None
+    intent = classify_query(message)
+    direct_answer = known_answer(message, raw_messages)
     calendar_query = resolve_calendar_query(
-        message,
-        raw_messages,
-        schedule_college=schedule_college,
-    )
+        message, raw_messages, schedule_college=schedule_college,
+    ) if direct_answer is None and intent is not QueryIntent.PERSONAL_SCHEDULE else None
+    # Explicit general study requests can omit mounted schedule data. Preserve
+    # it for follow-ups and uncertain routes where the record may matter.
+    if intent is QueryIntent.GENERAL_EDUCATIONAL and len(message.split()) >= 4 and not any(
+        key in message.casefold() for key in ("جدول", "معدل", "مسجل", "منهجي", "مقرري", "درجات", "مادتي", "بيانات", "my ", "grade", "gpa", "schedule", "المثال", "السابق", "هذا", "هذي", "it ", "previous", "above")
+    ):
+        schedule_context = None
     calendar_resolution = None
     length_context = response_policy_prompt(message)
     academic_calendar_context = (
@@ -172,9 +180,9 @@ async def process_chat(
 
     # 4. Current-information requests go straight to the web; static official
     # and uncertain university intent retain the File Search -> web fallback.
-    intent = classify_query(message)
+    require_official = needs_authoritative_policy(message)
     use_web_search = intent is QueryIntent.TIME_SENSITIVE_UNIVERSITY
-    use_file_search = intent in {
+    use_file_search = (require_official and not use_web_search) or intent in {
         QueryIntent.OFFICIAL_UNIVERSITY,
         QueryIntent.UNCERTAIN,
     }
@@ -188,7 +196,6 @@ async def process_chat(
     # 5. Stream to client, collect result for Firestore
     accumulated_text: list[str] = []
     accumulated_citations: list[dict] = []
-    token_usage = None
     ttft: float | None = None
     file_search_attempted = False
     provider_failed = False
@@ -208,6 +215,7 @@ async def process_chat(
 
     def public_done(payload: dict) -> str:
         public_payload = {key: value for key, value in payload.items() if key != "evidence"}
+        public_payload["citations"] = accumulated_citations
         return "data: " + json.dumps(public_payload) + "\n\n"
 
     async def persist_assistant_message() -> bool:
@@ -263,8 +271,22 @@ async def process_chat(
     background_tasks.tasks.add(user_save_task)
     user_save_task.add_done_callback(background_tasks.tasks.discard)
 
+    trace = UsageTrace(route=(
+        "verified_direct" if direct_answer else "official_calendar" if calendar_query else intent.value
+    ))
+    trace_token = current_usage.set(trace)
+
+    def verify_retrieval(answer: str, citations: list[dict], evidence: list[str]) -> tuple[str, list[dict]]:
+        applicable = applicable_citations(citations, require_official=require_official)
+        # Never publish text based on a citation that was discarded at this boundary.
+        if not applicable or len(applicable) != len(citations) or not answer:
+            return missing_evidence_answer(message), []
+        safe_answer, _ = sanitize_university_id_answer(message, answer, evidence)
+        return safe_answer, applicable
+
     try:
         initial_status = (
+            "generating_answer" if direct_answer else
             "searching_ku_web"
             if calendar_query is not None or use_web_search
             else "searching_knowledge"
@@ -283,7 +305,13 @@ async def process_chat(
         else:
             user_message_saved = await asyncio.shield(user_save_task)
 
-        if calendar_query is not None:
+        if direct_answer is not None:
+            citations = direct_answer.citations()
+            accumulated_text.append(direct_answer.text)
+            accumulated_citations.extend(citations)
+            yield "data: " + json.dumps({"type": "chunk", "content": direct_answer.text}) + "\n\n"
+            done_payload = {"type": "done", "citations": citations}
+        elif calendar_query is not None:
             answer = format_calendar_answer(
                 calendar_query,
                 calendar_resolution,
@@ -332,7 +360,6 @@ async def process_chat(
                     elif payload.get("type") == "done":
                         web_citations.extend(payload.get("citations", []))
                         web_evidence.extend(payload.get("evidence", []))
-                        token_usage = payload.get("usage")
                         done_payload = payload
                     elif payload.get("type") == "error":
                         web_error = payload
@@ -340,13 +367,7 @@ async def process_chat(
                 provider_failed = True
                 yield "data: " + json.dumps(web_error) + "\n\n"
                 return
-            answer = "".join(web_text).strip()
-            if not web_citations:
-                answer = missing_evidence_answer(message)
-            else:
-                answer, _ = sanitize_university_id_answer(
-                    message, answer, web_evidence
-                )
+            answer, web_citations = verify_retrieval("".join(web_text).strip(), web_citations, web_evidence)
             accumulated_text.append(answer)
             accumulated_citations.extend(web_citations)
             yield "data: " + json.dumps(
@@ -358,7 +379,6 @@ async def process_chat(
             retrieved_text: list[str] = []
             retrieved_citations: list[dict] = []
             retrieved_evidence: list[str] = []
-            retrieved_usage = None
             retrieved_done: dict | None = None
 
             async for sse_line in stream_response(
@@ -378,13 +398,13 @@ async def process_chat(
                 elif payload.get("type") == "done":
                     retrieved_citations.extend(payload.get("citations", []))
                     retrieved_evidence.extend(payload.get("evidence", []))
-                    retrieved_usage = payload.get("usage")
                     retrieved_done = payload
 
             retrieved_answer = "".join(retrieved_text).strip()
-            if not should_fallback_to_web(
-                retrieved_answer,
-                retrieved_citations,
+            usable_retrieved_citations = applicable_citations(retrieved_citations, require_official=require_official)
+            if (
+                retrieved_answer and len(usable_retrieved_citations) == len(retrieved_citations)
+                and not should_fallback_to_web(retrieved_answer, usable_retrieved_citations)
             ):
                 yield "data: " + json.dumps(
                     {"type": "status", "status": "generating_answer"}
@@ -395,7 +415,6 @@ async def process_chat(
                     retrieved_evidence,
                 )
                 accumulated_citations.extend(retrieved_citations)
-                token_usage = retrieved_usage
                 done_payload = retrieved_done or {
                     "type": "done",
                     "citations": retrieved_citations,
@@ -412,6 +431,11 @@ async def process_chat(
                             ttft = time.perf_counter() - openai_start
                         yield sse_line
             else:
+                trace.fallback_reason = (
+                    "inapplicable_file_citations" if retrieved_citations and len(usable_retrieved_citations) != len(retrieved_citations)
+                    else "missing_file_citations" if not retrieved_citations
+                    else "insufficient_file_answer"
+                )
                 yield "data: " + json.dumps(
                     {"type": "status", "status": "searching_ku_web"}
                 ) + "\n\n"
@@ -438,7 +462,6 @@ async def process_chat(
                         elif payload.get("type") == "done":
                             web_citations.extend(payload.get("citations", []))
                             web_evidence.extend(payload.get("evidence", []))
-                            token_usage = payload.get("usage")
                             done_payload = payload
                         elif payload.get("type") == "error":
                             web_error = payload
@@ -446,15 +469,7 @@ async def process_chat(
                     provider_failed = True
                     yield "data: " + json.dumps(web_error) + "\n\n"
                     return
-                web_answer = "".join(web_text).strip()
-                if not web_citations:
-                    safe_answer = missing_evidence_answer(message)
-                else:
-                    safe_answer, _ = sanitize_university_id_answer(
-                        message,
-                        web_answer,
-                        web_evidence,
-                    )
+                safe_answer, web_citations = verify_retrieval("".join(web_text).strip(), web_citations, web_evidence)
                 accumulated_text.append(safe_answer)
                 accumulated_citations.extend(web_citations)
                 yield "data: " + json.dumps(
@@ -476,7 +491,6 @@ async def process_chat(
                         accumulated_text.append(payload.get("content", ""))
                     elif payload.get("type") == "done":
                         accumulated_citations.extend(payload.get("citations", []))
-                        token_usage = payload.get("usage")
                 if payload is not None and payload.get("type") == "done":
                     done_payload = payload
                 else:
@@ -508,26 +522,7 @@ async def process_chat(
     finally:
         openai_latency = time.perf_counter() - openai_start
 
-        # Estimate cost (rough approx for gpt-4o-mini)
-        est_cost = 0.0
-        if token_usage:
-            # gpt-4o-mini: $0.150 / 1M input, $0.600 / 1M output
-            in_cost = (token_usage.get("prompt_tokens", 0) / 1_000_000) * 0.150
-            out_cost = (token_usage.get("completion_tokens", 0) / 1_000_000) * 0.600
-            est_cost = in_cost + out_cost
-
-        logger.info(
-            "OpenAI stream completed.",
-            extra={
-                "operational_metadata": {
-                    "ttft": ttft,
-                    "latency": openai_latency,
-                    "model": config.OPENAI_MODEL,
-                    "token_usage": token_usage,
-                    "estimated_cost": round(est_cost, 6)
-                }
-            }
-        )
+        trace.summary("foreground", ttft=ttft, latency=openai_latency)
 
         # Persist partial text on disconnect/error.  Successful streams already
         # persisted before their final `done` event.
@@ -537,14 +532,18 @@ async def process_chat(
 
         # 8. Background Task: Missed Query Analytics
         was_file_search_attempted = file_search_attempted
-        if not provider_failed and (
-            (was_file_search_attempted and not accumulated_citations) or "عذراً" in final_text
-        ):
-            background_tasks.create_task(
-                analyze_and_log_missed_query(
-                    query=message,
-                    chat_id=session_id,
-                    was_file_search_attempted=was_file_search_attempted,
-                    model_used=config.OPENAI_MODEL
-                )
+        try:
+            should_analyze = direct_answer is None and calendar_query is None and not provider_failed and (
+                (was_file_search_attempted and not accumulated_citations) or "عذراً" in final_text
             )
+            if should_analyze:
+                background_tasks.create_task(
+                    analyze_and_log_missed_query(
+                        query=message,
+                        chat_id=session_id,
+                        was_file_search_attempted=was_file_search_attempted,
+                        model_used=config.OPENAI_MODEL
+                    )
+                )
+        finally:
+            current_usage.reset(trace_token)

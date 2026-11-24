@@ -6,6 +6,8 @@ Analyzes missed queries in the background and upserts them into Firestore.
 
 import hashlib
 import json
+
+from .provider_usage import ProviderAttempt, current_usage, input_breakdown
 import logging
 
 from app.openai_client import get_openai_client
@@ -23,6 +25,8 @@ async def analyze_and_log_missed_query(
     Background task: Use an LLM to classify why the query was missed,
     hash it for deduplication, and store it in Firestore.
     """
+    trace = current_usage.get()
+    telemetry = None
     try:
         # 1. Deterministic ID based on normalized text
         normalized_query = query.strip().lower()
@@ -35,6 +39,8 @@ async def analyze_and_log_missed_query(
 Your job is to classify a user's query that the main AI was unable to answer.
 Determine the most appropriate category and the likely reason the main AI could not answer it."""
 
+        messages = [{"role": "user", "content": f"Query: {query}"}]
+        telemetry = ProviderAttempt("gpt-4o-mini", "missed_query_classification", input_breakdown(messages, system_prompt, "gpt-4o-mini"))
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -67,6 +73,8 @@ Determine the most appropriate category and the likely reason the main AI could 
             max_completion_tokens=128,
         )
         
+        telemetry.response = response
+        telemetry.outcome = "completed"
         raw_result = response.choices[0].message.content
         result = json.loads(raw_result)
         
@@ -87,5 +95,12 @@ Determine the most appropriate category and the likely reason the main AI could 
             chat_id=chat_id
         )
         
-    except Exception as e:
-        logger.exception("Error in analyze_and_log_missed_query background task: %s", e)
+    except Exception as exc:
+        if telemetry and telemetry.response is None:
+            telemetry.outcome = "exception"
+        logger.warning("Missed-query analytics failed (%s)", type(exc).__name__)
+    finally:
+        if telemetry:
+            telemetry.finish()
+        if trace:
+            trace.summary("including_background")

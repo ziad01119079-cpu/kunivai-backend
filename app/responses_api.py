@@ -31,6 +31,7 @@ from .config import get_config
 from .openai_client import get_openai_client
 from .services.coordination_runtime import distributed_enabled
 from .services.response_policy import response_policy_for
+from .services.provider_usage import ProviderAttempt, input_breakdown
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ _TRANSIENT_STREAM_CODES = {"server_error", "internal_error"}
 _KNOWN_PROVIDER_CODES = _TRANSIENT_STREAM_CODES | {
     "rate_limit_exceeded", "insufficient_quota", "invalid_api_key",
     "invalid_request_error", "model_not_found", "vector_store_not_found",
+    "openai_budget_exhausted", "openai_daily_budget_exhausted", "provider_coordination_unavailable",
 }
 
 
@@ -91,15 +93,17 @@ async def stream_response(
     max_output_tokens: int | None = None,
 ) -> AsyncIterator[str]:
     """Retry one known transient in-band provider failure before any text."""
+    retry_reason = None
     for attempt in range(2):
         try:
             async with aclosing(_stream_response_once(
-                messages, system_prompt, tools, max_output_tokens, allow_retry=attempt == 0,
+                messages, system_prompt, tools, max_output_tokens, allow_retry=attempt == 0, retry_reason=retry_reason,
             )) as stream:
                 async for item in stream:
                     yield item
             return
-        except _RetryBeforeOutput:
+        except _RetryBeforeOutput as exc:
+            retry_reason = str(exc)
             logger.info("Retrying Responses API once after a transient in-stream failure")
             await asyncio.sleep(0.3)
 
@@ -111,6 +115,7 @@ async def _stream_response_once(
     max_output_tokens: int | None,
     *,
     allow_retry: bool,
+    retry_reason: str | None,
 ) -> AsyncIterator[str]:
     """
     Async generator that yields SSE-formatted strings.
@@ -145,18 +150,18 @@ async def _stream_response_once(
     incomplete_reason: str | None = None
     provider_request_id = None
     stream_opened = False
+    if tools is None:
+        tools = [{"type": "file_search", "vector_store_ids": [config.OPENAI_VECTOR_STORE_ID]}]
+    telemetry = ProviderAttempt(
+        config.OPENAI_MODEL,
+        "responses",
+        input_breakdown(messages, system_prompt, config.OPENAI_MODEL),
+        tuple(tool["type"] for tool in tools),
+        retry_reason,
+    )
 
     try:
         logger.info("Starting Responses API stream")
-
-        # If tools is not provided, default to file_search with vector store
-        if tools is None:
-            tools = [
-                {
-                    "type": "file_search",
-                    "vector_store_ids": [config.OPENAI_VECTOR_STORE_ID],
-                }
-            ]
 
         request_options = {
             "model": config.OPENAI_MODEL,
@@ -185,6 +190,11 @@ async def _stream_response_once(
             )
             async for event in stream:
                 event_type = event.type
+                telemetry.observe_tool(getattr(event, "item", None))
+                response = getattr(event, "response", None)
+                if response is not None:
+                    telemetry.response = response
+                    telemetry.terminal_response = event_type in {"response.completed", "response.incomplete", "response.failed"}
 
                 # ── Text delta ──────────────────────────────────────────
                 if event_type == "response.output_text.delta":
@@ -200,6 +210,7 @@ async def _stream_response_once(
                 # ── Completed: collect file_search annotations ──────────
                 elif event_type == "response.completed":
                     completed = True
+                    telemetry.outcome = "completed"
                     response = event.response
                     response_usage = getattr(response, "usage", None)
                     if response_usage is not None:
@@ -228,6 +239,7 @@ async def _stream_response_once(
                                                 {
                                                     "file_id": ann.file_id,
                                                     "index": ann.index,
+                                                    "filename": getattr(ann, "filename", None),
                                                 }
                                             )
                                         elif (
@@ -246,6 +258,7 @@ async def _stream_response_once(
 
                 elif event_type == "response.incomplete":
                     response = event.response
+                    telemetry.outcome = "incomplete"
                     details = getattr(response, "incomplete_details", None)
                     incomplete_reason = str(
                         getattr(details, "reason", None) or "unknown"
@@ -253,9 +266,10 @@ async def _stream_response_once(
                 elif event_type in {"error", "response.failed"}:
                     error = getattr(event.response, "error", None) if event_type == "response.failed" else event
                     code = _provider_code(error)
+                    telemetry.outcome = code
                     _log_provider_failure(code, provider_request_id, has_output=bool(full_text_parts))
                     if allow_retry and not full_text_parts and code in _TRANSIENT_STREAM_CODES:
-                        raise _RetryBeforeOutput
+                        raise _RetryBeforeOutput(code)
                     yield _provider_error_event(
                         "LLM_RATE_LIMITED" if code == "rate_limit_exceeded" else "LLM_UNAVAILABLE",
                         retryable=code in _TRANSIENT_STREAM_CODES or code == "rate_limit_exceeded",
@@ -265,6 +279,7 @@ async def _stream_response_once(
     except _RetryBeforeOutput:
         raise
     except (TimeoutError, APITimeoutError):
+        telemetry.outcome = "timeout"
         _log_provider_failure("timeout", provider_request_id, has_output=bool(full_text_parts))
         yield (
             "data: "
@@ -279,6 +294,7 @@ async def _stream_response_once(
         code = _provider_code(exc.body)
         if code == "unknown":
             code = _provider_code(exc)
+        telemetry.outcome = code
         status = exc.status_code if isinstance(exc, APIStatusError) else None
         request_id = provider_request_id or _provider_request_id(
             exc.response.headers if isinstance(exc, APIStatusError) else None
@@ -295,7 +311,7 @@ async def _stream_response_once(
             stream_opened and status is None and code in _TRANSIENT_STREAM_CODES
             and allow_retry and not full_text_parts
         ):
-            raise _RetryBeforeOutput from None
+            raise _RetryBeforeOutput(code) from None
         temporarily_limited = code == "rate_limit_exceeded" or (
             status == 429 and code != "insufficient_quota"
         )
@@ -309,9 +325,13 @@ async def _stream_response_once(
         )
         return
     except Exception as exc:
+        telemetry.outcome = "exception"
         logger.warning("Responses API stream failed (%s)", type(exc).__name__)
         yield _provider_error_event()
         return
+
+    finally:
+        telemetry.finish()
 
     if incomplete_reason is not None:
         logger.warning("Responses API output incomplete: %s", incomplete_reason)
@@ -399,8 +419,9 @@ async def _resolve_citations(
         except Exception:
             return file_id, file_id  # fallback to ID
 
-    results = await asyncio.gather(*(fetch_name(fid) for fid in seen_ids))
-    filename_map = dict(results)
+    filename_map = {fid: item["filename"] for fid, item in seen_ids.items() if item.get("filename")}
+    results = await asyncio.gather(*(fetch_name(fid) for fid in seen_ids if fid not in filename_map))
+    filename_map.update(results)
 
     return [
         Citation(

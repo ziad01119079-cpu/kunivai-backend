@@ -41,7 +41,7 @@ def _estimate_tokens(text: str, model: str = "gpt-4o") -> int:
     if not text:
         return 0
     encoding = _get_encoding(model)
-    return len(encoding.encode(text))
+    return len(encoding.encode(text, disallowed_special=()))
 
 
 def build_history(

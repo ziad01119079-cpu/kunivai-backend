@@ -9,6 +9,7 @@ from redis.exceptions import RedisError
 
 from .coordination_runtime import get_redis_runtime
 from .distributed_coordination import EPOCH_LUA
+from .provider_usage import current_usage
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,9 @@ class BudgetedProviderTransport(httpx.AsyncBaseTransport):
         except RedisError:
             logger.warning("provider_reservation_rejected reason=coordination_unavailable")
             return self.rejection(503, "provider_coordination_unavailable")
-        logger.info("provider_attempt_reserved", extra={"operational_metadata": {
+        trace = current_usage.get()
+        logger.info("provider_attempt_reserved", extra={"cost_telemetry": True, "operational_metadata": {
+            "trace_id": trace.trace_id if trace else None,
             "reserved_tokens": tokens, "reserved_tool_calls": tools, "reserved_uploads": uploads,
         }})
         return await self.transport.handle_async_request(request)

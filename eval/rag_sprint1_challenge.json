@@ -1,0 +1,118 @@
+[
+  {
+    "id": "H01",
+    "question": "كم يساوي ١٧ ÷ ٤؟",
+    "expect": [
+      "17 ÷ 4 = 17/4"
+    ],
+    "mock_answer": "لم أجد مرجعاً",
+    "required_urls": [],
+    "require_no_citations": true,
+    "max_attempts": 0,
+    "verdict": "verified"
+  },
+  {
+    "id": "H02",
+    "question": "When is the course withdrawal deadline in fall semester 2026-2027 at the College of Law?",
+    "expect": [
+      "22 October 2026"
+    ],
+    "mock_answer": "",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/lawcalender"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "H03",
+    "question": "متى فترة التحويل للفصل الأول 2027/2028 في التقويم العام؟",
+    "expect": [
+      "11/1/2028",
+      "13/1/2028"
+    ],
+    "mock_answer": "",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/academic-calendar-0"
+    ],
+    "ban": [
+      "2027 -"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "H04",
+    "question": "Student account recovery after password reset?",
+    "expect": [
+      "could not find reliable"
+    ],
+    "mock_answer": "Use Kansas's recovery portal.",
+    "required_urls": [],
+    "mock_urls": [
+      "https://sar.ku.edu/refunds",
+      "https://cis.ku.edu.kw/ar/contact-us"
+    ],
+    "ban": [
+      "Kansas"
+    ],
+    "require_no_citations": true,
+    "verdict": "uncertainty"
+  },
+  {
+    "id": "H05",
+    "question": "What is my course schedule?",
+    "expect": [
+      "Synthetic Course"
+    ],
+    "mock_answer": "Synthetic Course is in your schedule.",
+    "required_urls": [],
+    "require_no_citations": true,
+    "required_tools": [],
+    "verdict": "verified"
+  },
+  {
+    "id": "H06",
+    "question": "اشرح لي المشتقة مع مثال قصير",
+    "expect": [
+      "الميل"
+    ],
+    "mock_answer": "المشتقة تعطي الميل اللحظي.",
+    "required_urls": [],
+    "require_no_citations": true,
+    "required_tools": [],
+    "measure_schedule": true,
+    "verdict": "verified"
+  },
+  {
+    "id": "H07",
+    "question": "Could these grades clear academic probation?",
+    "expect": [
+      "cumulative GPA",
+      "credits per course"
+    ],
+    "mock_answer": "Yes, they clear it.",
+    "required_urls": [
+      "https://www.ku.edu.kw/sites/default/files/2025-08/FAQAr.pdf"
+    ],
+    "verdict": "clarification"
+  },
+  {
+    "id": "H08",
+    "question": "أقصد هذه السنة",
+    "expect": [
+      "لن أخمّن"
+    ],
+    "mock_answer": "لا يوجد تاريخ مدعوم",
+    "required_urls": [],
+    "mock_urls": [],
+    "prior": [
+      "كيف أتعلم البرمجة؟",
+      "متى موعد التحويل؟"
+    ],
+    "ban": [
+      "أكتوبر",
+      "يناير"
+    ],
+    "verdict": "uncertainty",
+    "require_no_citations": true
+  }
+]

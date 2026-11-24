@@ -1,0 +1,248 @@
+[
+  {
+    "id": "Q001",
+    "question": "متى فاينل سنة أولى في كلية الحقوق؟",
+    "expect": [
+      "غير متحقق"
+    ],
+    "mock_answer": "",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/lawcalender"
+    ],
+    "ban": [
+      "30 يناير"
+    ],
+    "verdict": "uncertainty"
+  },
+  {
+    "id": "Q002",
+    "question": "لكلية الحقوق سنة أولى",
+    "expect": [
+      "غير متحقق"
+    ],
+    "mock_answer": "",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/lawcalender"
+    ],
+    "prior": [
+      "متى اختبارات الفاينل؟"
+    ],
+    "ban": [
+      "30 يناير"
+    ],
+    "verdict": "uncertainty"
+  },
+  {
+    "id": "Q005",
+    "question": "لو جبت A وB- وD هل يروح الإنذار الأكاديمي؟",
+    "expect": [
+      "التراكمي",
+      "وحدات كل مقرر"
+    ],
+    "mock_answer": "أكيد يروح الإنذار إذا تحسن معدلك الفصلي.",
+    "required_urls": [
+      "https://www.ku.edu.kw/sites/default/files/2025-08/FAQAr.pdf"
+    ],
+    "verdict": "clarification"
+  },
+  {
+    "id": "Q006",
+    "question": "أبي مجرشيت اللغة العربية آداب",
+    "expect": [
+      "الآداب",
+      "2025/2026"
+    ],
+    "mock_answer": "هذه خطة كلية التربية من 135 وحدة.",
+    "required_urls": [
+      "https://arts.ku.edu.kw/sites/default/files/2026-09/StudnetGuide25-26.pdf"
+    ],
+    "ban": [
+      "التربية"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "Q014",
+    "question": "حساب الطالب فيه مشكلة",
+    "expect": [
+      "هل المشكلة",
+      "الدخول"
+    ],
+    "mock_answer": "هذه طريقة الحساب البنكي على Enroll & Pay.",
+    "required_urls": [],
+    "mock_urls": [
+      "https://sar.ku.edu/refunds"
+    ],
+    "ban": [
+      "Enroll"
+    ],
+    "require_no_citations": true,
+    "verdict": "clarification"
+  },
+  {
+    "id": "Q025",
+    "question": "شلون ادخل على Gemini Enterprise؟",
+    "expect": [
+      "Gemini Enterprise",
+      "ما قدرت أتحقق"
+    ],
+    "mock_answer": "أعد تعيين كلمة سر الطالب لاستلام كود الدخول.",
+    "required_urls": [
+      "https://afaq.ku.edu.kw/ar/media-center/news/n3-61",
+      "https://cis.ku.edu.kw/ar/contact-us"
+    ],
+    "ban": [
+      "أعد تعيين"
+    ],
+    "verdict": "uncertainty"
+  },
+  {
+    "id": "Q029",
+    "question": "أقصد في الفصل الأول من هذه السنة الحالية",
+    "expect": [
+      "24 أكتوبر 2026"
+    ],
+    "mock_answer": "آخر يوم 4 أغسطس 2026.",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/academic-calendar-0"
+    ],
+    "prior": [
+      "متى آخر يوم سحب مواد؟"
+    ],
+    "ban": [
+      "4 أغسطس"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "Q030",
+    "question": "أقصد هذه السنة",
+    "expect": [
+      "24 أكتوبر 2026"
+    ],
+    "mock_answer": "4 أغسطس 2026.",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/academic-calendar-0"
+    ],
+    "prior": [
+      "أقصد الفصل الأول",
+      "متى آخر يوم انسحاب من المقررات؟"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "Q031",
+    "question": "مراعاة لتاريخ اليوم، متى آخر يوم سحب مواد؟",
+    "expect": [
+      "24 أكتوبر 2026"
+    ],
+    "mock_answer": "موعد السحب 23 أكتوبر 2027.",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/academic-calendar-0"
+    ],
+    "ban": [
+      "23 أكتوبر 2027"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "Q054",
+    "question": "المصطلحات والرموز الجامعية",
+    "expect": [
+      "تجاوز العبء الدراسي",
+      "الرمز"
+    ],
+    "mock_answer": "الأوفر لود هو مقرر خارج الخطة.",
+    "required_urls": [
+      "https://shi.ku.edu.kw/ar/courses-system-list"
+    ],
+    "verdict": "clarification"
+  },
+  {
+    "id": "Q066",
+    "question": "هل لدى جامعة الكويت ذكاء اصطناعي غيرك؟",
+    "expect": [
+      "Gemini Enterprise",
+      "لكل الطلبة"
+    ],
+    "mock_answer": "أنا تابع للجامعة ولا أعرف غيري.",
+    "required_urls": [
+      "https://afaq.ku.edu.kw/ar/media-center/news/n3-61"
+    ],
+    "ban": [
+      "أنا تابع"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "Q067",
+    "question": "هل أنت مساعد تابع لجامعة الكويت؟",
+    "expect": [
+      "لا أملك ما يثبت"
+    ],
+    "mock_answer": "نعم، أنا تابع رسميًا للجامعة.",
+    "required_urls": [],
+    "ban": [
+      "نعم"
+    ],
+    "require_no_citations": true,
+    "verdict": "uncertainty"
+  },
+  {
+    "id": "Q068",
+    "question": "متى آخر وقت لتقديم وقف القيد؟",
+    "expect": [
+      "22 أكتوبر 2026"
+    ],
+    "mock_answer": "التاريخ 21 أكتوبر 2027.",
+    "required_urls": [
+      "https://do.ku.edu.kw/ar/academic-calendar-0"
+    ],
+    "ban": [
+      "21 أكتوبر 2027"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "Q073",
+    "question": "في برنامج ذكاء اصطناعي لجامعة الكويت شسمه؟",
+    "expect": [
+      "Gemini Enterprise"
+    ],
+    "mock_answer": "المقرر CS301.",
+    "required_urls": [
+      "https://afaq.ku.edu.kw/ar/media-center/news/n3-61"
+    ],
+    "ban": [
+      "CS301"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "Q099",
+    "question": "اعرض اللنك في الشات",
+    "expect": [
+      "دليل الطالب الجديد"
+    ],
+    "mock_answer": "[دليل الطالب.pdf]",
+    "required_urls": [
+      "https://www.ku.edu.kw/ar/new-student-journey"
+    ],
+    "prior": [
+      "ممكن رابط دليل الطالب؟"
+    ],
+    "verdict": "verified"
+  },
+  {
+    "id": "Q100",
+    "question": "وين رابط دليل الطالب؟",
+    "expect": [
+      "دليل الطالب الجديد"
+    ],
+    "mock_answer": "[دليل الطالب.pdf]",
+    "required_urls": [
+      "https://www.ku.edu.kw/ar/new-student-journey"
+    ],
+    "verdict": "verified"
+  }
+]
