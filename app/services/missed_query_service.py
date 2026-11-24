@@ -63,7 +63,8 @@ Determine the most appropriate category and the likely reason the main AI could 
                     "strict": True
                 }
             },
-            temperature=0.0
+            temperature=0.0,
+            max_completion_tokens=128,
         )
         
         raw_result = response.choices[0].message.content

@@ -37,8 +37,9 @@ from ..responses_api import stream_response
 from ..schedule_repository import load_user_schedules
 from .schedule_context import build_schedule_context
 from .grounding import missing_evidence_answer, sanitize_university_id_answer
+from .response_policy import response_policy_prompt
 from ..task_tracker import background_tasks
-from ..logger import chat_id_var, uid_var
+from ..logger import chat_id_var, generation_fence_var, uid_var
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ async def process_chat(
     message: str,
     system_context: str | None = None,
     correlation_id: str | None = None,
+    generation_claim: str | None = None,
 ) -> AsyncIterator[str]:
     """
     Handle the core business logic of generating a chat stream.
@@ -152,11 +154,16 @@ async def process_chat(
         schedule_college=schedule_college,
     )
     calendar_resolution = None
+    length_context = response_policy_prompt(message)
     academic_calendar_context = (
         calendar_prompt_context(calendar_query, calendar_resolution)
         if calendar_query
         else None
     )
+    if academic_calendar_context:
+        academic_calendar_context = f"{academic_calendar_context}\n\n{length_context}"
+    else:
+        academic_calendar_context = length_context
     system_prompt = get_system_prompt(
         system_context,
         schedule_context,
@@ -184,6 +191,7 @@ async def process_chat(
     token_usage = None
     ttft: float | None = None
     file_search_attempted = False
+    provider_failed = False
     done_payload: dict | None = None
     assistant_persistence_attempted = False
 
@@ -202,30 +210,39 @@ async def process_chat(
         public_payload = {key: value for key, value in payload.items() if key != "evidence"}
         return "data: " + json.dumps(public_payload) + "\n\n"
 
-    async def persist_assistant_message() -> None:
+    async def persist_assistant_message() -> bool:
         nonlocal assistant_persistence_attempted
         if assistant_persistence_attempted:
-            return
+            return False
         final_text = "".join(accumulated_text).strip()
         if not final_text:
-            return
+            return False
         assistant_persistence_attempted = True
         if not user_message_saved:
             logger.error(
                 "Skipping assistant persistence because the user turn was not saved for session %s",
                 session_id,
             )
-            return
+            return False
         try:
-            await asyncio.wait_for(
-                save_assistant_message(
-                    uid=uid,
-                    session_id=session_id,
-                    content=final_text,
-                    citations=accumulated_citations,
-                ),
+            save_kwargs = {
+                "uid": uid,
+                "session_id": session_id,
+                "content": final_text,
+                "citations": accumulated_citations,
+            }
+            if correlation_id:
+                save_kwargs["correlation_id"] = correlation_id
+            generation_fence = generation_fence_var.get()
+            if generation_fence is not None:
+                save_kwargs["generation_fence"] = generation_fence
+            if generation_claim is not None:
+                save_kwargs["generation_claim"] = generation_claim
+            saved = await asyncio.wait_for(
+                save_assistant_message(**save_kwargs),
                 timeout=PERSISTENCE_TIMEOUT_SECONDS,
             )
+            return saved is not False
         except asyncio.TimeoutError:
             logger.error(
                 "Timed out saving assistant message for session %s after %.1fs",
@@ -238,6 +255,7 @@ async def process_chat(
                 session_id,
                 exc,
             )
+        return False
 
     # Start persistence after the history snapshot.  Yield the route status
     # first so a slow Firestore commit never delays the initial SSE response.
@@ -256,10 +274,16 @@ async def process_chat(
         yield "data: " + json.dumps(
             {"type": "status", "status": initial_status}
         ) + "\n\n"
-        user_message_saved = await asyncio.shield(user_save_task)
+        if calendar_query is not None:
+            # The official lookup uses the context snapshot and can run during the user write.
+            user_message_saved, calendar_resolution = await asyncio.gather(
+                asyncio.shield(user_save_task),
+                lookup_official_calendar(calendar_query),
+            )
+        else:
+            user_message_saved = await asyncio.shield(user_save_task)
 
         if calendar_query is not None:
-            calendar_resolution = await lookup_official_calendar(calendar_query)
             answer = format_calendar_answer(
                 calendar_query,
                 calendar_resolution,
@@ -313,6 +337,7 @@ async def process_chat(
                     elif payload.get("type") == "error":
                         web_error = payload
             if web_error is not None:
+                provider_failed = True
                 yield "data: " + json.dumps(web_error) + "\n\n"
                 return
             answer = "".join(web_text).strip()
@@ -339,10 +364,15 @@ async def process_chat(
             async for sse_line in stream_response(
                 history_dicts, system_prompt, tools=tools
             ):
-                buffered_lines.append(sse_line)
                 payload = parse_sse(sse_line)
+                if payload is None or payload.get("type") != "done":
+                    buffered_lines.append(sse_line)
                 if payload is None:
                     continue
+                if payload.get("type") == "error":
+                    provider_failed = True
+                    yield sse_line
+                    return
                 if payload.get("type") == "chunk":
                     retrieved_text.append(payload.get("content", ""))
                 elif payload.get("type") == "done":
@@ -378,9 +408,6 @@ async def process_chat(
                 else:
                     accumulated_text.extend(retrieved_text)
                     for sse_line in buffered_lines:
-                        payload = parse_sse(sse_line)
-                        if payload is not None and payload.get("type") == "done":
-                            continue
                         if ttft is None and '"type": "chunk"' in sse_line:
                             ttft = time.perf_counter() - openai_start
                         yield sse_line
@@ -416,6 +443,7 @@ async def process_chat(
                         elif payload.get("type") == "error":
                             web_error = payload
                 if web_error is not None:
+                    provider_failed = True
                     yield "data: " + json.dumps(web_error) + "\n\n"
                     return
                 web_answer = "".join(web_text).strip()
@@ -440,6 +468,10 @@ async def process_chat(
                     ttft = time.perf_counter() - openai_start
                 payload = parse_sse(sse_line)
                 if payload is not None:
+                    if payload.get("type") == "error":
+                        provider_failed = True
+                        yield sse_line
+                        return
                     if payload.get("type") == "chunk":
                         accumulated_text.append(payload.get("content", ""))
                     elif payload.get("type") == "done":
@@ -453,16 +485,26 @@ async def process_chat(
         # `done` means both messages have been committed in order (or that a
         # persistence failure was logged).  This makes immediate follow-ups see
         # the complete preceding turn and keeps `done` the final SSE event.
-        await persist_assistant_message()
-        if done_payload is not None:
+        persisted = await persist_assistant_message()
+        if done_payload is not None and generation_claim is not None and not persisted:
+            yield 'data: ' + json.dumps({
+                "type": "error", "code": "AI_PERSISTENCE_UNCONFIRMED", "retryable": False,
+                "message": "تعذر تأكيد حفظ الإجابة. تحقق من سجل المحادثة.",
+            }) + '\n\n'
+        elif done_payload is not None:
             yield public_done(done_payload)
 
     except asyncio.CancelledError:
         logger.warning("Client disconnected during stream for session %s", session_id)
         raise
-    except Exception as e:
-        logger.error("Error during OpenAI stream for session %s: %s", session_id, e)
-        yield f'data: {{"type": "error", "message": "{e}"}}\n\n'
+    except Exception:
+        logger.exception("Chat stream failed for session %s", session_id)
+        yield "data: " + json.dumps({
+            "type": "error",
+            "code": "CHAT_UPSTREAM_ERROR",
+            "retryable": True,
+            "message": "تعذر إكمال الإجابة مؤقتاً. حاول مرة أخرى.",
+        }) + "\n\n"
     finally:
         openai_latency = time.perf_counter() - openai_start
 
@@ -490,12 +532,14 @@ async def process_chat(
         # Persist partial text on disconnect/error.  Successful streams already
         # persisted before their final `done` event.
         final_text = "".join(accumulated_text).strip()
-        if final_text and not assistant_persistence_attempted:
+        if generation_claim is None and final_text and not assistant_persistence_attempted and not provider_failed:
             await persist_assistant_message()
 
         # 8. Background Task: Missed Query Analytics
         was_file_search_attempted = file_search_attempted
-        if (was_file_search_attempted and not accumulated_citations) or "عذراً" in final_text:
+        if not provider_failed and (
+            (was_file_search_attempted and not accumulated_citations) or "عذراً" in final_text
+        ):
             background_tasks.create_task(
                 analyze_and_log_missed_query(
                     query=message,

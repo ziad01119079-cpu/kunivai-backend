@@ -1,0 +1,10 @@
+# Build on a disposable development builder. Run with --network none.
+FROM python:3.11-slim
+WORKDIR /code
+RUN apt-get update && apt-get install -y --no-install-recommends redis-server \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt requirements-test.txt ./
+RUN pip install --no-cache-dir -r requirements-test.txt
+COPY app /code/app
+COPY scripts/scalability_mock_app.py scripts/validate_distributed.py /code/scripts/
+ENTRYPOINT ["python", "scripts/validate_distributed.py", "--redis-server", "/usr/bin/redis-server"]

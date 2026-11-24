@@ -1,0 +1,33 @@
+services:
+  redis:
+    profiles: ["local-redis"]
+    image: ${KUNIV_STAGING_REDIS_IMAGE:?set a reviewed Linux ARM64 Redis image}
+    network_mode: host
+    restart: unless-stopped
+    command: ["redis-server", "/run/config/redis.conf"]
+    volumes:
+      - redis-data:/data
+      - ${KUNIV_STAGING_REDIS_CONFIG:?set protected Redis configuration path}:/run/config/redis.conf:ro
+      - ${KUNIV_STAGING_REDIS_ACL:?set protected Redis ACL path}:/run/config/users.acl:ro
+  api:
+    image: ${KUNIV_STAGING_API_IMAGE:?set the immutable candidate image}
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 60s
+    env_file:
+      - ${KUNIV_STAGING_ENV_FILE:?set protected staging environment file}
+    environment:
+      KUNIV_SCALABLE: "1"
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-service-account.json
+    volumes:
+      - ${KUNIV_STAGING_FIREBASE_CREDENTIALS:?set staging credentials path}:/run/secrets/firebase-service-account.json:ro
+    command: ["uvicorn", "app.worker_bootstrap:create_app", "--factory", "--host", "${KUNIV_STAGING_BIND_HOST:-127.0.0.1}", "--port", "${KUNIV_STAGING_API_PORT:-18080}",
+              "--workers", "${KUNIV_STAGING_WORKERS:-1}", "--limit-concurrency", "${KUNIV_STAGING_CONNECTION_LIMIT:-192}", "--proxy-headers",
+              "--forwarded-allow-ips", "${KUNIV_TRUSTED_PROXY_IPS:-127.0.0.1}", "--timeout-graceful-shutdown", "25"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${KUNIV_STAGING_API_PORT:-18080}/ready', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+volumes:
+  redis-data:

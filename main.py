@@ -24,6 +24,7 @@ Environment variables (set on Railway → Variables):
 
 import logging
 import os
+import hmac
 
 from dotenv import load_dotenv
 from app.local_notification_test import enabled as local_notification_test_enabled
@@ -32,7 +33,8 @@ from app.local_notification_test import enabled as local_notification_test_enabl
 if not local_notification_test_enabled():
     load_dotenv()
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -51,6 +53,8 @@ from app.routers import (
 )
 from app.logger import setup_logging, request_id_var
 from app.task_tracker import background_tasks
+from app.services.coordination_runtime import close_redis, distributed_enabled, get_redis_runtime, redis_ready
+from app.openai_client import close_openai_client
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +80,11 @@ async def lifespan(app: FastAPI):
             cfg.HISTORY_TOKEN_BUDGET,
         )
         init_firebase()
+        if os.getenv("KUNIV_SCALABLE", "0") == "1":
+            if not distributed_enabled() or not get_redis_runtime().epoch or "*" in cors_origins:
+                raise RuntimeError("Scalable mode requires Redis epoch and explicit CORS origins")
+        if distributed_enabled() and not await redis_ready():
+            raise RuntimeError("Redis coordination is enabled but unavailable")
     except Exception as e:
         logger.error(f"Startup validation failed: {e}")
         raise
@@ -97,6 +106,10 @@ async def lifespan(app: FastAPI):
     
     logger.info("Shutting down KuwaitChatAI backend…")
     await background_tasks.wait_all(timeout=10.0)
+    try:
+        await close_redis()
+    finally:
+        await close_openai_client()
 
 # ---------------------------------------------------------------------------
 # App
@@ -116,9 +129,13 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── CORS ────────────────────────────────────────────────────────────────────
 # Allow requests from Flutter Web, mobile, and the admin dashboard.
+cors_origins = [
+    origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Restrict to your domain(s) in production
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -136,7 +153,12 @@ class CorrelationIdMiddleware:
 
         headers = dict(scope.get("headers", []))
         req_id_bytes = headers.get(b"x-request-id")
-        req_id = req_id_bytes.decode("latin1") if req_id_bytes else str(uuid.uuid4())
+        req_id = str(uuid.uuid4())
+        if req_id_bytes and len(req_id_bytes) <= 64:
+            try:
+                req_id = str(uuid.UUID(req_id_bytes.decode("ascii")))
+            except (ValueError, UnicodeError):
+                pass
             
         token = request_id_var.set(req_id)
         
@@ -176,8 +198,39 @@ async def ready():
         # Verify Firebase is initialized
         from firebase_admin import get_app
         get_app()
+        if not await redis_ready():
+            raise RuntimeError("Redis coordination unavailable")
         return {"status": "ready"}
     except Exception as e:
         logger.error(f"Readiness check failed: {e}")
         from fastapi import HTTPException
         raise HTTPException(status_code=503, detail="Service not ready")
+
+
+@app.get("/internal/capacity", include_in_schema=False)
+async def capacity_metrics(request: Request):
+    token = os.getenv("KUNIV_METRICS_TOKEN")
+    supplied = request.headers.get("authorization", "")
+    if not token or not hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode()):
+        raise HTTPException(404)
+    if not distributed_enabled() or not await redis_ready():
+        raise HTTPException(503, "Redis coordination unavailable")
+    runtime = get_redis_runtime()
+    try:
+        seconds, micros = await runtime.client.time()
+        now = int(seconds) * 1000 + int(micros) // 1000
+        async with runtime.client.pipeline(transaction=False) as pipe:
+            pipe.zcount(runtime.capacity.active_key, now, "+inf")
+            pipe.zcount(runtime.capacity.queue_key, now, "+inf")
+            pipe.zcount(f"{runtime.requests.prefix}:sse", now, "+inf")
+            pipe.info("clients")
+            active, queued, subscribers, clients = await pipe.execute()
+    except Exception:
+        raise HTTPException(503, "Coordination metrics unavailable") from None
+    values = {
+        "kuniv_generations_active": active, "kuniv_queue_depth": queued,
+        "kuniv_sse_subscribers": subscribers,
+        "kuniv_redis_connected_clients": clients["connected_clients"],
+        "kuniv_redis_blocked_clients": clients["blocked_clients"],
+    }
+    return PlainTextResponse("".join(f"{name} {value}\n" for name, value in values.items()))

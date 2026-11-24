@@ -1,0 +1,14 @@
+# Dedicated staging benchmark hostname, separate from the staging app.
+{$KUNIV_STAGING_MOCK_HOST} {
+    @outside_testers not remote_ip {$KUNIV_STAGING_ALLOWED_CIDR}
+    respond @outside_testers 403
+
+    @mock path /chat /__mock/stats
+    reverse_proxy @mock 127.0.0.1:18081 {
+        header_up -X-Forwarded-For
+        header_up X-Forwarded-For {remote_host}
+        header_up -X-Real-IP
+        header_up X-Real-IP {remote_host}
+    }
+    respond 404
+}

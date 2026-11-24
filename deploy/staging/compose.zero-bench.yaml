@@ -1,0 +1,44 @@
+services:
+  app:
+    image: ${KUNIV_BENCH_API_IMAGE:?set a locally built fixture image}
+    pull_policy: never
+    network_mode: none
+    cpus: ${KUNIV_BENCH_CPUS:-0.5}
+    mem_limit: ${KUNIV_BENCH_MEMORY:-1g}
+    stop_grace_period: 60s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - "${KUNIV_BENCH_DIR:?set a private fixture directory}:/bench"
+    environment:
+      KUNIV_BENCH_ISOLATED: "1"
+      KUNIV_MOCK_RUN_ID: ${KUNIV_MOCK_RUN_ID:?set a unique run ID}
+      COORDINATION_BACKEND: redis
+      REDIS_URL: unix:///bench/redis.sock
+      REDIS_KEY_PREFIX: kuniv-bench
+      AI_MAX_CONCURRENT_GENERATIONS: ${KUNIV_BENCH_ACTIVE:-20}
+      AI_MAX_QUEUED_GENERATIONS: ${KUNIV_BENCH_QUEUE:-40}
+      AI_QUEUE_TIMEOUT_SECONDS: "5"
+      AI_IP_RATE_LIMIT: ${KUNIV_BENCH_IP_RATE:-120/minute}
+    command: ["uvicorn", "app.worker_bootstrap:create_zero_bench_app", "--factory", "--uds", "/bench/api.sock",
+              "--workers", "${KUNIV_BENCH_WORKERS:-1}", "--no-access-log"]
+    depends_on:
+      redis:
+        condition: service_healthy
+  redis:
+    image: ${KUNIV_BENCH_REDIS_IMAGE:?set a preloaded ARM64 Redis image}
+    pull_policy: never
+    network_mode: none
+    cpus: "0.20"
+    mem_limit: 384m
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - "${KUNIV_BENCH_DIR:?set a private fixture directory}:/bench"
+    command: ["redis-server", "--port", "0", "--unixsocket", "/bench/redis.sock",
+              "--unixsocketperm", "777", "--dir", "/bench", "--appendonly", "yes",
+              "--appendfsync", "everysec", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-s", "/bench/redis.sock", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10

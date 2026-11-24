@@ -1,0 +1,24 @@
+{
+  "parameters": {
+    "CHAT": {
+      "defaultValue": {"value": "https://staging-api.kunivai.online/chat"},
+      "valueType": "STRING"
+    },
+    "UPLOAD_URL": {
+      "defaultValue": {"value": "https://staging-api.kunivai.online/upload"},
+      "valueType": "STRING"
+    },
+    "ASSETS_URL": {
+      "defaultValue": {"value": "https://staging-api.kunivai.online/assets"},
+      "valueType": "STRING"
+    },
+    "SCHEDULE_IMPORT_URL": {
+      "defaultValue": {"value": "https://staging-api.kunivai.online/schedules/import"},
+      "valueType": "STRING"
+    },
+    "NOTIFICATIONS_BASE_URL": {
+      "defaultValue": {"value": "https://staging-api.kunivai.online"},
+      "valueType": "STRING"
+    }
+  }
+}

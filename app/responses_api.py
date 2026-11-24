@@ -19,13 +19,56 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+from collections.abc import Mapping
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import AsyncIterator
 
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
+
 from .config import get_config
 from .openai_client import get_openai_client
+from .services.coordination_runtime import distributed_enabled
+from .services.response_policy import response_policy_for
 
 logger = logging.getLogger(__name__)
+
+_TRANSIENT_STREAM_CODES = {"server_error", "internal_error"}
+_KNOWN_PROVIDER_CODES = _TRANSIENT_STREAM_CODES | {
+    "rate_limit_exceeded", "insufficient_quota", "invalid_api_key",
+    "invalid_request_error", "model_not_found", "vector_store_not_found",
+}
+
+
+class _RetryBeforeOutput(Exception):
+    pass
+
+
+def _provider_code(error) -> str:
+    if isinstance(error, Mapping):
+        error = error.get("error", error)
+    code = error.get("code") if isinstance(error, Mapping) else getattr(error, "code", None)
+    return code if isinstance(code, str) and code in _KNOWN_PROVIDER_CODES else "unknown"
+
+
+def _provider_request_id(headers) -> str | None:
+    value = headers.get("x-request-id") if headers is not None else None
+    return value if isinstance(value, str) and re.fullmatch(r"req_[A-Za-z0-9_-]{1,80}", value) else None
+
+
+def _log_provider_failure(code, request_id, *, has_output, status=None):
+    logger.warning(
+        "Responses API failure code=%s provider_request_id=%s status=%s has_output=%s",
+        code, request_id or "unavailable", status, has_output,
+    )
+
+
+def _provider_error_event(code="LLM_UNAVAILABLE", *, retryable=True) -> str:
+    return "data: " + json.dumps({
+        "type": "error", "code": code, "retryable": retryable,
+        "message": "تعذر إكمال الإجابة من مزود الذكاء الاصطناعي.",
+    }) + "\n\n"
 
 
 @dataclass
@@ -45,6 +88,29 @@ async def stream_response(
     messages: list[dict],   # [{"role": "user"|"assistant", "content": "..."}]
     system_prompt: str,
     tools: list[dict] | None = None,
+    max_output_tokens: int | None = None,
+) -> AsyncIterator[str]:
+    """Retry one known transient in-band provider failure before any text."""
+    for attempt in range(2):
+        try:
+            async with aclosing(_stream_response_once(
+                messages, system_prompt, tools, max_output_tokens, allow_retry=attempt == 0,
+            )) as stream:
+                async for item in stream:
+                    yield item
+            return
+        except _RetryBeforeOutput:
+            logger.info("Retrying Responses API once after a transient in-stream failure")
+            await asyncio.sleep(0.3)
+
+
+async def _stream_response_once(
+    messages: list[dict],
+    system_prompt: str,
+    tools: list[dict] | None,
+    max_output_tokens: int | None,
+    *,
+    allow_retry: bool,
 ) -> AsyncIterator[str]:
     """
     Async generator that yields SSE-formatted strings.
@@ -64,15 +130,24 @@ async def stream_response(
         {"role": "system", "content": system_prompt},
         *messages,
     ]
+    if max_output_tokens is None:
+        latest_user_message = next(
+            (str(item.get("content", "")) for item in reversed(messages) if item.get("role") == "user"),
+            "",
+        )
+        max_output_tokens = response_policy_for(latest_user_message).max_output_tokens
 
     full_text_parts: list[str] = []
     raw_citations: list[dict] = []   # file and URL citations
     evidence_texts: list[str] = []
     usage: dict | None = None
+    completed = False
+    incomplete_reason: str | None = None
+    provider_request_id = None
+    stream_opened = False
 
     try:
-        import traceback
-        logger.info(f"DEBUG: Starting Responses API stream")
+        logger.info("Starting Responses API stream")
 
         # If tools is not provided, default to file_search with vector store
         if tools is None:
@@ -88,8 +163,11 @@ async def stream_response(
             "input": input_messages,
             "tools": tools,
         }
+        request_options["max_output_tokens"] = max_output_tokens
         if tools:
             request_options["tool_choice"] = "required"
+            if distributed_enabled():
+                request_options["max_tool_calls"] = 2
         if any(tool.get("type") == "file_search" for tool in tools):
             # `include=None` is not equivalent to omission for every SDK/API
             # version, so send this parameter only for File Search requests.
@@ -99,6 +177,12 @@ async def stream_response(
         async with client.responses.stream(
             **request_options,
         ) as stream:
+            stream_opened = True
+            # The SDK's stream exposes the HTTP response via a private field.
+            # This optional diagnostic must remain safe if that field moves.
+            provider_request_id = _provider_request_id(
+                getattr(getattr(stream, "_response", None), "headers", None)
+            )
             async for event in stream:
                 event_type = event.type
 
@@ -115,6 +199,7 @@ async def stream_response(
 
                 # ── Completed: collect file_search annotations ──────────
                 elif event_type == "response.completed":
+                    completed = True
                     response = event.response
                     response_usage = getattr(response, "usage", None)
                     if response_usage is not None:
@@ -159,16 +244,92 @@ async def stream_response(
                                                 }
                                             )
 
-    except Exception as exc:
-        import traceback
-        tb = traceback.format_exc()
-        logger.error(f"DEBUG: Error streaming Responses API. Traceback:\n{tb}")
-        logger.exception("Error streaming Responses API: %s", exc)
+                elif event_type == "response.incomplete":
+                    response = event.response
+                    details = getattr(response, "incomplete_details", None)
+                    incomplete_reason = str(
+                        getattr(details, "reason", None) or "unknown"
+                    )
+                elif event_type in {"error", "response.failed"}:
+                    error = getattr(event.response, "error", None) if event_type == "response.failed" else event
+                    code = _provider_code(error)
+                    _log_provider_failure(code, provider_request_id, has_output=bool(full_text_parts))
+                    if allow_retry and not full_text_parts and code in _TRANSIENT_STREAM_CODES:
+                        raise _RetryBeforeOutput
+                    yield _provider_error_event(
+                        "LLM_RATE_LIMITED" if code == "rate_limit_exceeded" else "LLM_UNAVAILABLE",
+                        retryable=code in _TRANSIENT_STREAM_CODES or code == "rate_limit_exceeded",
+                    )
+                    return
+
+    except _RetryBeforeOutput:
+        raise
+    except (TimeoutError, APITimeoutError):
+        _log_provider_failure("timeout", provider_request_id, has_output=bool(full_text_parts))
         yield (
             "data: "
-            + json.dumps({"type": "error", "message": str(exc)})
+            + json.dumps({
+                "type": "error", "code": "LLM_TIMEOUT", "retryable": True,
+                "message": "انتهت مهلة مزود الذكاء الاصطناعي. حاول مرة أخرى.",
+            })
             + "\n\n"
         )
+        return
+    except APIError as exc:
+        code = _provider_code(exc.body)
+        if code == "unknown":
+            code = _provider_code(exc)
+        status = exc.status_code if isinstance(exc, APIStatusError) else None
+        request_id = provider_request_id or _provider_request_id(
+            exc.response.headers if isinstance(exc, APIStatusError) else None
+        )
+        _log_provider_failure(code, request_id, has_output=bool(full_text_parts), status=status)
+        if isinstance(exc, APIStatusError) and code == "openai_budget_exhausted":
+            yield "data: " + json.dumps({
+                "type": "error", "code": "OPENAI_BUDGET_EXHAUSTED",
+                "retryable": True, "retry_after_seconds": int(exc.response.headers.get("retry-after", "1")),
+                "message": "تم بلوغ حد مزود الذكاء الاصطناعي مؤقتاً. حاول بعد قليل.",
+            }) + "\n\n"
+            return
+        if (
+            stream_opened and status is None and code in _TRANSIENT_STREAM_CODES
+            and allow_retry and not full_text_parts
+        ):
+            raise _RetryBeforeOutput from None
+        temporarily_limited = code == "rate_limit_exceeded" or (
+            status == 429 and code != "insufficient_quota"
+        )
+        yield _provider_error_event(
+            "LLM_RATE_LIMITED" if temporarily_limited else "LLM_UNAVAILABLE",
+            retryable=(
+                temporarily_limited or code in _TRANSIENT_STREAM_CODES
+                or isinstance(exc, APIConnectionError)
+                or (status is not None and (status == 408 or status >= 500))
+            ),
+        )
+        return
+    except Exception as exc:
+        logger.warning("Responses API stream failed (%s)", type(exc).__name__)
+        yield _provider_error_event()
+        return
+
+    if incomplete_reason is not None:
+        logger.warning("Responses API output incomplete: %s", incomplete_reason)
+        yield "data: " + json.dumps({
+            "type": "error",
+            "code": "OUTPUT_LIMIT_REACHED",
+            "retryable": False,
+            "reason": incomplete_reason,
+            "message": "توقفت الإجابة قبل اكتمالها بسبب حد الطول.",
+        }) + "\n\n"
+        return
+    if not completed:
+        yield "data: " + json.dumps({
+            "type": "error",
+            "code": "LLM_STREAM_INTERRUPTED",
+            "retryable": True,
+            "message": "انقطع بث مزود الذكاء الاصطناعي قبل اكتماله.",
+        }) + "\n\n"
         return
 
     # ── Resolve filenames (post-stream, non-blocking) ───────────────────

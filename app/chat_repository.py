@@ -12,6 +12,7 @@ import logging
 from datetime import datetime, timezone
 
 from firebase_admin import firestore_async
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore
 
 from .config import get_config
@@ -70,14 +71,16 @@ async def save_user_message(
     db = _db()
     batch = db.batch()
     
-    msg_ref = (
+    messages_ref = (
         db.collection("users")
         .document(uid)
         .collection("chats")
         .document(session_id)
         .collection("messages")
-        .document()
     )
+    # A client-generated UUID makes an ambiguous retry overwrite the same
+    # logical user turn instead of creating a duplicate document.
+    msg_ref = messages_ref.document(correlation_id) if correlation_id else messages_ref.document()
     
     msg_data = {
         "content": content,
@@ -111,30 +114,63 @@ async def save_user_message(
     return msg_ref.id
 
 
+async def claim_generation(uid: str, session_id: str, message_id: str, token: str, fingerprint: str) -> str:
+    """Authorize at most one ambiguous generation for this durable message identity."""
+    db = _db()
+    session = db.collection("users").document(uid).collection("chats").document(session_id)
+    claim = session.collection("generationClaims").document(message_id)
+    answer = session.collection("messages").document(f"{message_id}-assistant")
+
+    # Legacy writers must drain before cutover. Distributed writers can only
+    # create an answer after winning this document's atomic create.
+    current = await claim.get()
+    if current.exists:
+        return "existing" if current.to_dict().get("fingerprint") == fingerprint else "conflict"
+    if (await answer.get()).exists:
+        current = await claim.get()
+        if current.exists and current.to_dict().get("fingerprint") != fingerprint:
+            return "conflict"
+        return "existing"
+    try:
+        await claim.create({"token": token, "fingerprint": fingerprint, "createdAt": firestore.SERVER_TIMESTAMP})
+    except AlreadyExists:
+        current = await claim.get()
+        if current.exists and current.to_dict().get("fingerprint") != fingerprint:
+            return "conflict"
+        return "existing"
+    return "claimed"
+
+
 async def save_assistant_message(
     uid: str,
     session_id: str,
     content: str,
     citations: list[dict],
-) -> None:
+    correlation_id: str | None = None,
+    generation_fence: int | None = None,
+    generation_claim: str | None = None,
+) -> bool:
     """Save the assistant's response to Firestore using a batch write."""
     db = _db()
     batch = db.batch()
     
-    msg_ref = (
+    messages_ref = (
         db.collection("users")
         .document(uid)
         .collection("chats")
         .document(session_id)
         .collection("messages")
-        .document()
     )
-    batch.set(msg_ref, {
+    assistant_id = f"{correlation_id}-assistant" if correlation_id else None
+    msg_ref = messages_ref.document(assistant_id) if assistant_id else messages_ref.document()
+    message_data = {
         "content": content,
         "isUser": False,
         "citations": citations,
         "createdAt": firestore.SERVER_TIMESTAMP,
-    })
+    }
+    if generation_fence is not None:
+        message_data["generationFence"] = generation_fence
 
     session_ref = (
         db.collection("users")
@@ -142,14 +178,45 @@ async def save_assistant_message(
         .collection("chats")
         .document(session_id)
     )
-    batch.set(session_ref, {"lastMessageAt": firestore.SERVER_TIMESTAMP}, merge=True)
-    batch.set(
-        db.collection("users").document(uid),
-        {
-            "lastMessageAt": firestore.SERVER_TIMESTAMP,
-            "lastChatId": session_id,
-        },
-        merge=True,
-    )
+    user_ref = db.collection("users").document(uid)
+    if assistant_id and (generation_fence is not None or generation_claim is not None):
+        transaction = db.transaction()
 
+        @firestore.async_transactional
+        async def commit_fenced(txn):
+            existing = await msg_ref.get(transaction=txn)
+            claim_ref = None
+            if generation_claim is not None:
+                claim_ref = session_ref.collection("generationClaims").document(correlation_id)
+                claim = await claim_ref.get(transaction=txn)
+                if not claim.exists or claim.to_dict().get("token") != generation_claim or existing.exists:
+                    return False
+            if existing.exists:
+                previous = int(existing.to_dict().get("generationFence", 0) or 0)
+                if previous > generation_fence:
+                    logger.warning(
+                        "Rejected stale assistant write fence=%s current=%s",
+                        generation_fence,
+                        previous,
+                    )
+                    return False
+            txn.set(msg_ref, message_data)
+            txn.set(session_ref, {"lastMessageAt": firestore.SERVER_TIMESTAMP}, merge=True)
+            txn.set(user_ref, {
+                "lastMessageAt": firestore.SERVER_TIMESTAMP,
+                "lastChatId": session_id,
+            }, merge=True)
+            if claim_ref is not None:
+                txn.update(claim_ref, {"completedAt": firestore.SERVER_TIMESTAMP})
+            return True
+
+        return await commit_fenced(transaction)
+
+    batch.set(msg_ref, message_data)
+    batch.set(session_ref, {"lastMessageAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    batch.set(user_ref, {
+        "lastMessageAt": firestore.SERVER_TIMESTAMP,
+        "lastChatId": session_id,
+    }, merge=True)
     await batch.commit()
+    return True

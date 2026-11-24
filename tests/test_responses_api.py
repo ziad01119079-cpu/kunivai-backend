@@ -3,6 +3,10 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
+import pytest
+from openai import APIError
+
 from app.responses_api import Citation, stream_response
 
 
@@ -21,6 +25,8 @@ class _FakeStream:
 
     async def _iterate(self):
         for event in self.events:
+            if isinstance(event, Exception):
+                raise event
             yield event
 
 
@@ -125,3 +131,141 @@ def test_non_retrieval_request_omits_tool_choice_and_include():
     assert "tool_choice" not in captured
     assert "include" not in captured
     assert json.loads(output[-1][6:].strip()) == {"type": "done", "citations": []}
+
+
+def test_output_token_limit_is_forwarded_to_provider():
+    captured = {}
+    response = SimpleNamespace(usage=None, output=[])
+
+    class Responses:
+        def stream(self, **kwargs):
+            captured.update(kwargs)
+            return _FakeStream([SimpleNamespace(type="response.completed", response=response)])
+
+    async def run():
+        return [item async for item in stream_response([], "prompt", tools=[], max_output_tokens=220)]
+
+    with (
+        patch("app.responses_api.get_openai_client", return_value=SimpleNamespace(responses=Responses())),
+        patch("app.responses_api.get_config", return_value=SimpleNamespace(OPENAI_MODEL="test-model")),
+    ):
+        asyncio.run(run())
+    assert captured["max_output_tokens"] == 220
+
+
+def test_provider_failure_returns_sanitized_typed_error(caplog):
+    class Responses:
+        def stream(self, **_kwargs):
+            raise RuntimeError("secret upstream detail")
+
+    async def run():
+        return [item async for item in stream_response([], "prompt", tools=[])]
+
+    with (
+        patch("app.responses_api.get_openai_client", return_value=SimpleNamespace(responses=Responses())),
+        patch("app.responses_api.get_config", return_value=SimpleNamespace(OPENAI_MODEL="test-model")),
+    ):
+        output = asyncio.run(run())
+    payload = json.loads(output[-1][6:].strip())
+    assert payload["code"] == "LLM_UNAVAILABLE"
+    assert payload["retryable"] is True
+    assert "secret" not in payload["message"]
+    assert "secret upstream detail" not in caplog.text
+
+
+def _provider_stream_error(code):
+    return APIError(
+        "private upstream detail",
+        request=httpx.Request("POST", "https://example.invalid/responses"),
+        body={"error": {"code": code, "message": "private upstream detail"}},
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_events", "next_events", "attempts", "types", "code"),
+    [
+        ([_provider_stream_error("server_error")], ["done"], 2, ["done"], None),
+        ([_provider_stream_error("server_error")], [_provider_stream_error("server_error")],
+         2, ["error"], "LLM_UNAVAILABLE"),
+        (["chunk", _provider_stream_error("server_error")], [], 1, ["chunk", "error"], "LLM_UNAVAILABLE"),
+        ([_provider_stream_error("insufficient_quota")], [], 1, ["error"], "LLM_UNAVAILABLE"),
+        ([_provider_stream_error("rate_limit_exceeded")], [], 1, ["error"], "LLM_RATE_LIMITED"),
+        ([_provider_stream_error("unrecognized_body")], [], 1, ["error"], "LLM_UNAVAILABLE"),
+        ([SimpleNamespace(type="response.failed", response=SimpleNamespace(
+            error=SimpleNamespace(code="internal_error")
+        ))], ["done"], 2, ["done"], None),
+    ],
+)
+def test_in_band_provider_failure_retry_is_bounded(first_events, next_events, attempts, types, code, caplog):
+    calls = []
+    done = SimpleNamespace(type="response.completed", response=SimpleNamespace(usage=None, output=[]))
+    chunk = SimpleNamespace(type="response.output_text.delta", delta="partial")
+    fixture = {"done": done, "chunk": chunk}
+
+    def stream(**kwargs):
+        items = first_events if not calls else next_events
+        calls.append(kwargs)
+        result = _FakeStream([fixture[item] if isinstance(item, str) else item for item in items])
+        result._response = SimpleNamespace(headers={"x-request-id": "req_fake123"})
+        return result
+
+    async def run():
+        return [json.loads(item[6:]) async for item in stream_response([], "prompt", tools=[])]
+
+    with (
+        patch("app.responses_api.get_openai_client", return_value=SimpleNamespace(
+            responses=SimpleNamespace(stream=stream)
+        )),
+        patch("app.responses_api.get_config", return_value=SimpleNamespace(OPENAI_MODEL="test-model")),
+        patch("app.responses_api.distributed_enabled", return_value=True),
+        patch("app.responses_api.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        output = asyncio.run(run())
+
+    assert len(calls) == attempts
+    assert [item["type"] for item in output] == types
+    assert output[-1].get("code") == code
+    assert "provider_request_id=req_fake123" in caplog.text
+    assert "private upstream detail" not in caplog.text
+
+
+def test_incomplete_output_is_reported_instead_of_false_done():
+    response = SimpleNamespace(
+        incomplete_details=SimpleNamespace(reason="max_output_tokens")
+    )
+
+    class Responses:
+        def stream(self, **_kwargs):
+            return _FakeStream([
+                SimpleNamespace(type="response.output_text.delta", delta="partial"),
+                SimpleNamespace(type="response.incomplete", response=response),
+            ])
+
+    async def run():
+        return [item async for item in stream_response([], "prompt", tools=[])]
+
+    with (
+        patch("app.responses_api.get_openai_client", return_value=SimpleNamespace(responses=Responses())),
+        patch("app.responses_api.get_config", return_value=SimpleNamespace(OPENAI_MODEL="test-model")),
+    ):
+        output = asyncio.run(run())
+    payload = json.loads(output[-1][6:].strip())
+    assert payload["code"] == "OUTPUT_LIMIT_REACHED"
+    assert payload["reason"] == "max_output_tokens"
+    assert all('"type": "done"' not in item for item in output)
+
+
+def test_provider_eof_without_completion_is_interruption():
+    class Responses:
+        def stream(self, **_kwargs):
+            return _FakeStream([])
+
+    async def run():
+        return [item async for item in stream_response([], "prompt", tools=[])]
+
+    with (
+        patch("app.responses_api.get_openai_client", return_value=SimpleNamespace(responses=Responses())),
+        patch("app.responses_api.get_config", return_value=SimpleNamespace(OPENAI_MODEL="test-model")),
+    ):
+        output = asyncio.run(run())
+    assert json.loads(output[-1][6:].strip())["code"] == "LLM_STREAM_INTERRUPTED"

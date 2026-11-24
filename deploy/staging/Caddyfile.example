@@ -1,0 +1,19 @@
+staging-api.kunivai.online {
+    @outside_testers not remote_ip {$KUNIV_STAGING_ALLOWED_CIDR}
+    respond @outside_testers 403
+    respond /internal/* 404
+    @chat path /chat
+    request_body @chat {
+        max_size 16KB
+    }
+
+    # Caddy sets X-Forwarded-For from the actual downstream connection. Do not
+    # copy a client-supplied forwarding header into the upstream request.
+    reverse_proxy {$KUNIV_STAGING_UPSTREAMS:127.0.0.1:18080} {
+        health_uri /ready
+        header_up -X-Forwarded-For
+        header_up X-Forwarded-For {remote_host}
+        header_up -X-Real-IP
+        header_up X-Real-IP {remote_host}
+    }
+}

@@ -17,11 +17,30 @@ import os
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from firebase_admin import auth, firestore_async
+from firebase_admin import app_check, auth, firestore_async
 from .local_notification_test import enabled, validate_environment
 
 _bearer = HTTPBearer()
 logger = logging.getLogger(__name__)
+
+
+async def verify_chat_app_check(token: str | None) -> None:
+    mode = os.getenv("CHAT_APP_CHECK_MODE", "off")
+    if mode == "off":
+        return
+    allowed = set(os.getenv("CHAT_APP_CHECK_APP_IDS", "").split())
+    if mode not in {"report", "enforce"} or (mode == "enforce" and not allowed):
+        raise HTTPException(503, "App Check configuration unavailable")
+    if token and len(token) <= 4096:
+        try:
+            claims = await asyncio.to_thread(app_check.verify_token, token)
+            if not allowed or (claims.get("app_id") or claims.get("sub")) in allowed:
+                return
+        except Exception:
+            pass
+    logger.warning("chat_app_check_rejected mode=%s token_present=%s", mode, bool(token))
+    if mode == "enforce":
+        raise HTTPException(403, "App Check verification required")
 
 
 def _bootstrap_admin_uids() -> set[str]:

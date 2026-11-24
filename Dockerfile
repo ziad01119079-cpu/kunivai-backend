@@ -25,4 +25,4 @@ USER appuser
 EXPOSE 8080
 
 # Use exec form so uvicorn receives SIGTERM for graceful shutdown
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]

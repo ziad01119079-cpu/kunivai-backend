@@ -260,6 +260,45 @@ def test_exact_sequence_preserves_user_assistant_order_and_sse_contract():
     assert [message["isUser"] for message in messages] == [True, False, True, False]
 
 
+def test_calendar_lookup_overlaps_user_write_before_releasing_verified_answer():
+    async def run():
+        lookup_started = asyncio.Event()
+        user_written = asyncio.Event()
+
+        async def save_user(*args, **kwargs):
+            await asyncio.wait_for(lookup_started.wait(), timeout=1)
+            user_written.set()
+
+        async def official_lookup(query):
+            lookup_started.set()
+            await asyncio.wait_for(user_written.wait(), timeout=1)
+            return await lookup_official_calendar(query, fetcher=_fetcher(), checked_at=CHECKED_AT)
+
+        async def save_assistant(*args, **kwargs):
+            assert user_written.is_set()
+
+        with (
+            patch("app.services.chat_service.get_config", return_value=CONFIG),
+            patch("app.services.chat_service.load_recent_messages", return_value=[]),
+            patch("app.services.chat_service.load_user_schedules", return_value=[]),
+            patch("app.services.chat_service.save_user_message", save_user),
+            patch("app.services.chat_service.save_assistant_message", save_assistant),
+            patch("app.services.chat_service.lookup_official_calendar", official_lookup),
+            patch("app.services.academic_calendar.kuwait_today", return_value=TODAY),
+        ):
+            return [
+                _payload(event)
+                async for event in process_chat(
+                    "uid", "session", "متى آخر يوم للانسحاب من المقررات للفصل الأول؟"
+                )
+            ]
+
+    events = asyncio.run(run())
+    assert [event["type"] for event in events] == ["status", "chunk", "done"]
+    assert "24 أكتوبر 2026" in events[1]["content"]
+    assert events[2]["citations"]
+
+
 def test_relative_year_and_semester_followups_retain_original_event():
     history = [
         {"isUser": False, "content": "إجابة سابقة"},

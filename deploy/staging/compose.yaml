@@ -1,0 +1,22 @@
+services:
+  kunivai-api-staging:
+    image: kunivai-api:test-3f803c5
+    container_name: kunivai-api-staging
+    restart: unless-stopped
+    env_file:
+      - ${KUNIV_STAGING_ENV_FILE:?set KUNIV_STAGING_ENV_FILE}
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-service-account.json
+    volumes:
+      - type: bind
+        source: ${KUNIV_STAGING_FIREBASE_CREDENTIALS:?set credentials path}
+        target: /run/secrets/firebase-service-account.json
+        read_only: true
+    ports:
+      - 127.0.0.1:18080:8080
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 20s

@@ -3,15 +3,17 @@
 
 
 import logging
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 
-from ..auth import verify_token
+from ..auth import verify_chat_app_check, verify_token
 from ..limiter import limiter
 from ..schedule_repository import create_schedule_version
 from ..services.schedule_extraction import extract_schedule
 from ..services.schedule_fingerprint import InvalidFingerprintData, build_schedule_identity
+from ..services.coordination_runtime import distributed_enabled, enforce_route_rate
 
 
 logger = logging.getLogger(__name__)
@@ -54,12 +56,14 @@ async def _read_pdf(file: UploadFile) -> bytes:
 
 
 @router.post("/import")
-@limiter.limit("5/minute")
+@limiter.limit("5/minute", exempt_when=distributed_enabled)
 async def import_schedule(
     request: Request,
     file: UploadFile = File(..., description="Kuwait University student schedule PDF"),
     uid: str = Depends(verify_token),
 ):
+    await verify_chat_app_check(request.headers.get("x-firebase-appcheck"))
+    await enforce_route_rate(uid, "schedule-import", int(os.getenv("SCHEDULE_IMPORT_RPM_PER_USER", "5")))
     pdf_bytes = await _read_pdf(file)
     filename = file.filename or "schedule.pdf"
 

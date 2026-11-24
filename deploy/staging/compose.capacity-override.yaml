@@ -1,0 +1,4 @@
+services:
+  api:
+    cpus: ${KUNIV_STAGING_API_CPUS:?set the approved API CPU cap}
+    mem_limit: ${KUNIV_STAGING_API_MEMORY:?set the approved API memory cap}

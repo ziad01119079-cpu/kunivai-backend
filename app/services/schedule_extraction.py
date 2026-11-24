@@ -68,6 +68,7 @@ async def extract_schedule(pdf_bytes: bytes, filename: str) -> ScheduleExtractio
             }
         ],
         text_format=ScheduleExtraction,
+        max_output_tokens=4096,
         store=False,
     )
     parsed = response.output_parsed

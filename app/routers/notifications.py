@@ -7,8 +7,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from firebase_admin import auth
 
-from ..auth import verify_admin
+from ..auth import _decode_token, verify_admin
 from ..limiter import limiter
+from ..services.coordination_runtime import distributed_enabled, enforce_route_rate
 from ..services.notification_service import (
     AnnouncementDeliveryError,
     AnnouncementIdempotencyConflict,
@@ -50,7 +51,7 @@ async def optional_uid(
     if credentials is None:
         return None
     try:
-        return auth.verify_id_token(credentials.credentials)["uid"]
+        return (await _decode_token(credentials.credentials))["uid"]
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired Firebase ID token.") from exc
 
@@ -160,7 +161,7 @@ async def announcement_stats(_admin_uid: str = Depends(verify_admin)):
 
 
 @router.post("/announcements/{announcement_id}/views")
-@limiter.limit("20/minute")
+@limiter.limit("20/minute", exempt_when=distributed_enabled)
 async def record_announcement_view(
     announcement_id: str,
     payload: AnnouncementViewRequest,
@@ -169,6 +170,8 @@ async def record_announcement_view(
 ):
     if len(announcement_id) > 128 or "/" in announcement_id:
         raise HTTPException(status_code=422, detail="Invalid announcement identifier.")
+    origin = request.client.host if request.client else "unknown"
+    await enforce_route_rate(uid or origin, "announcement-user" if uid else "announcement-anonymous-ip", 20)
     try:
         identity = viewer_identity(installation_id=payload.installationId, uid=uid)
         counted = await NotificationRepository().record_view(

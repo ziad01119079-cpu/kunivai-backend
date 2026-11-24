@@ -8,6 +8,7 @@ from datetime import datetime
 request_id_var: ContextVar[str] = ContextVar("request_id", default="")
 chat_id_var: ContextVar[str] = ContextVar("chat_id", default="")
 uid_var: ContextVar[str] = ContextVar("uid", default="")
+generation_fence_var: ContextVar[int | None] = ContextVar("generation_fence", default=None)
 
 class JSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -27,6 +28,8 @@ class JSONFormatter(logging.Formatter):
             
         uid = uid_var.get()
         if uid: log_obj["uid"] = uid
+        fence = generation_fence_var.get()
+        if fence is not None: log_obj["generation_fence"] = fence
 
         # Add any extra operational metadata passed via `extra={"operational_metadata": {...}}`
         if hasattr(record, "operational_metadata"):

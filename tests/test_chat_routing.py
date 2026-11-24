@@ -103,6 +103,40 @@ def test_official_request_uses_file_search_then_open_web_fallback():
     assert [_payload(event)["type"] for event in events[-2:]] == ["chunk", "done"]
 
 
+def test_failed_file_search_propagates_error_without_calling_web():
+    calls = []
+
+    async def empty(*_args):
+        return []
+
+    async def stream(messages, system_prompt, tools=None):
+        calls.append(tools)
+        yield 'data: {"type":"chunk","content":"partial"}\n\n'
+        yield 'data: {"type":"error","code":"LLM_UNAVAILABLE","retryable":false}\n\n'
+
+    async def run():
+        return [
+            _payload(event) async for event in process_chat(
+                "uid", "session", "ما شروط القبول في جامعة الكويت؟",
+            )
+        ]
+
+    with (
+        patch("app.services.chat_service.get_config", return_value=CONFIG),
+        patch("app.services.chat_service.load_recent_messages", empty),
+        patch("app.services.chat_service.load_user_schedules", empty),
+        patch("app.services.chat_service.stream_response", stream),
+        patch("app.services.chat_service.background_tasks.create_task", side_effect=_discard_task),
+        patch("app.services.chat_service.analyze_and_log_missed_query") as missed_query,
+    ):
+        events = asyncio.run(run())
+
+    assert [tools[0]["type"] for tools in calls] == ["file_search"]
+    missed_query.assert_not_called()
+    assert [event["type"] for event in events] == ["status", "error"]
+    assert events[-1]["code"] == "LLM_UNAVAILABLE"
+
+
 def test_uncertain_request_uses_existing_university_retrieval_path():
     captured = {}
 
