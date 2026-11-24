@@ -51,8 +51,8 @@ def input_breakdown(messages: list[dict], prompt: str, model: str) -> dict:
     """Count client-side text, independently per component, without retaining it."""
     def tokens(value: str) -> int:
         return _estimate_tokens(value, model)
-    schedule = re.search(r"<student_schedule_data>\s*(.*?)\s*</student_schedule_data>", prompt, re.S)
-    context = re.search(r"<user_provided_context>\s*(.*?)\s*</user_provided_context>", prompt, re.S)
+    schedule = re.search(r"^<student_schedule_data>\n(.*?)\n</student_schedule_data>$", prompt, re.M | re.S)
+    context = re.search(r"^<user_provided_context>\n(.*?)\n</user_provided_context>$", prompt, re.M | re.S)
     core = prompt
     if schedule:
         core = core.replace(schedule.group(0), "", 1)

@@ -10,7 +10,7 @@ from app import responses_api
 from app.logger import JSONFormatter, chat_id_var, request_id_var, uid_var
 from app.services.academic_calendar import CollegeScope, OfficialCalendarSource, resolve_calendar_query, verify_official_calendar_html
 from app.services.grounding import applicable_citations, official_ku_url
-from app.services.provider_usage import ProviderAttempt, UsageTrace, current_usage, estimate_cost
+from app.services.provider_usage import UsageTrace, current_usage, estimate_cost, input_breakdown
 from eval.run_rag_sprint1 import CHECKED, GENERAL, LAW, LAW_HTML, run
 
 
@@ -138,3 +138,17 @@ def test_missing_actual_model_is_not_priced_as_gpt_4o_mini():
     assert estimate_cost(None, tokens, 0, 0) is None
     assert estimate_cost("gpt-4o", tokens, 0, 0) == pytest.approx(0.0035)
     assert estimate_cost("gpt-4o-mini", tokens, 0, 0) == pytest.approx(0.00021)
+
+
+def test_prompt_attribution_ignores_inline_reference_to_schedule_markup():
+    from app.history_builder import _estimate_tokens
+    from app.prompts import get_system_prompt
+    payload = '{"availability":"available","scheduleCount":2,"schedules":[]}'
+    measured = input_breakdown(
+        [{"role": "user", "content": "prior context"}, {"role": "user", "content": "current question"}],
+        get_system_prompt("client context", payload),
+        "gpt-4o",
+    )
+    assert measured["schedule_text_tokens_est"] == _estimate_tokens(payload)
+    assert measured["history_text_tokens_est"] == _estimate_tokens("prior context")
+    assert measured["client_context_text_tokens_est"] == _estimate_tokens("client context")

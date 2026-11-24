@@ -1,0 +1,529 @@
+{
+  "baseline_commit": "df6c371d0936e4e152659f0169293d0436eb62a1",
+  "implementation_commit": "f004b9a07b2881c27b91ed1a779395cac9791d1d",
+  "pytest": {
+    "passed": 210,
+    "subtests_passed": 11,
+    "guarded_notification_integration": "not run"
+  },
+  "method": "Identical mocked provider and synthetic fixtures. Tokens are local text estimates.",
+  "splits": {
+    "development": {
+      "base": {
+        "passed": 3,
+        "cases": 16,
+        "checks": {
+          "factual_accuracy": [
+            3,
+            9
+          ],
+          "completeness": [
+            3,
+            16
+          ],
+          "source_applicability": [
+            4,
+            16
+          ],
+          "citations": [
+            4,
+            16
+          ],
+          "response_length": [
+            16,
+            16
+          ],
+          "usefulness": [
+            3,
+            16
+          ],
+          "routing": [
+            16,
+            16
+          ],
+          "terminal_done": [
+            16,
+            16
+          ]
+        },
+        "provider_attempts": 25,
+        "submitted_text_tokens": 31719,
+        "median_output_words": 15.0,
+        "failures": [
+          "Q001",
+          "Q002",
+          "Q005",
+          "Q006",
+          "Q014",
+          "Q025",
+          "Q030",
+          "Q054",
+          "Q066",
+          "Q067",
+          "Q073",
+          "Q099",
+          "Q100"
+        ]
+      },
+      "after": {
+        "passed": 16,
+        "cases": 16,
+        "checks": {
+          "factual_accuracy": [
+            9,
+            9
+          ],
+          "completeness": [
+            16,
+            16
+          ],
+          "source_applicability": [
+            16,
+            16
+          ],
+          "citations": [
+            16,
+            16
+          ],
+          "response_length": [
+            16,
+            16
+          ],
+          "usefulness": [
+            16,
+            16
+          ],
+          "routing": [
+            16,
+            16
+          ],
+          "terminal_done": [
+            16,
+            16
+          ]
+        },
+        "provider_attempts": 0,
+        "submitted_text_tokens": 0,
+        "median_output_words": 27.0,
+        "failures": []
+      }
+    },
+    "challenge": {
+      "base": {
+        "passed": 3,
+        "cases": 8,
+        "checks": {
+          "factual_accuracy": [
+            3,
+            5
+          ],
+          "completeness": [
+            3,
+            8
+          ],
+          "source_applicability": [
+            5,
+            8
+          ],
+          "citations": [
+            5,
+            8
+          ],
+          "response_length": [
+            8,
+            8
+          ],
+          "usefulness": [
+            3,
+            8
+          ],
+          "routing": [
+            6,
+            8
+          ],
+          "terminal_done": [
+            8,
+            8
+          ]
+        },
+        "provider_attempts": 8,
+        "submitted_text_tokens": 12328,
+        "median_output_words": 20.0,
+        "failures": [
+          "H01",
+          "H04",
+          "H05",
+          "H07",
+          "H08"
+        ]
+      },
+      "after": {
+        "passed": 8,
+        "cases": 8,
+        "checks": {
+          "factual_accuracy": [
+            5,
+            5
+          ],
+          "completeness": [
+            8,
+            8
+          ],
+          "source_applicability": [
+            8,
+            8
+          ],
+          "citations": [
+            8,
+            8
+          ],
+          "response_length": [
+            8,
+            8
+          ],
+          "usefulness": [
+            8,
+            8
+          ],
+          "routing": [
+            8,
+            8
+          ],
+          "terminal_done": [
+            8,
+            8
+          ]
+        },
+        "provider_attempts": 6,
+        "submitted_text_tokens": 8789,
+        "median_output_words": 17.5,
+        "failures": []
+      }
+    },
+    "holdout": {
+      "base": {
+        "passed": 1,
+        "cases": 8,
+        "checks": {
+          "factual_accuracy": [
+            1,
+            4
+          ],
+          "completeness": [
+            1,
+            8
+          ],
+          "source_applicability": [
+            5,
+            8
+          ],
+          "citations": [
+            5,
+            8
+          ],
+          "response_length": [
+            8,
+            8
+          ],
+          "usefulness": [
+            1,
+            8
+          ],
+          "routing": [
+            5,
+            8
+          ],
+          "terminal_done": [
+            8,
+            8
+          ]
+        },
+        "provider_attempts": 12,
+        "submitted_text_tokens": 16498,
+        "median_output_words": 17.5,
+        "failures": [
+          "T01",
+          "T03",
+          "T04",
+          "T05",
+          "T06",
+          "T07",
+          "T08"
+        ]
+      },
+      "after": {
+        "passed": 8,
+        "cases": 8,
+        "checks": {
+          "factual_accuracy": [
+            4,
+            4
+          ],
+          "completeness": [
+            8,
+            8
+          ],
+          "source_applicability": [
+            8,
+            8
+          ],
+          "citations": [
+            8,
+            8
+          ],
+          "response_length": [
+            8,
+            8
+          ],
+          "usefulness": [
+            8,
+            8
+          ],
+          "routing": [
+            8,
+            8
+          ],
+          "terminal_done": [
+            8,
+            8
+          ]
+        },
+        "provider_attempts": 1,
+        "submitted_text_tokens": 2094,
+        "median_output_words": 19.0,
+        "failures": []
+      }
+    }
+  },
+  "examples": {
+    "Q001": {
+      "base": {
+        "attempts": [
+          {
+            "tools": [
+              "file_search"
+            ],
+            "total_text_tokens": 1362,
+            "system_text_tokens": 1321,
+            "schedule_text_tokens": 19,
+            "history_text_tokens": 0,
+            "question_text_tokens": 12
+          },
+          {
+            "tools": [
+              "web_search"
+            ],
+            "total_text_tokens": 1169,
+            "system_text_tokens": 1128,
+            "schedule_text_tokens": 19,
+            "history_text_tokens": 0,
+            "question_text_tokens": 12
+          }
+        ],
+        "checked_citations": []
+      },
+      "after": {
+        "attempts": [],
+        "checked_citations": [
+          "https://do.ku.edu.kw/ar/academic-calendar-0",
+          "https://do.ku.edu.kw/ar/lawcalender"
+        ]
+      }
+    },
+    "Q014": {
+      "base": {
+        "attempts": [
+          {
+            "tools": [
+              "file_search"
+            ],
+            "total_text_tokens": 1355,
+            "system_text_tokens": 1321,
+            "schedule_text_tokens": 19,
+            "history_text_tokens": 0,
+            "question_text_tokens": 5
+          }
+        ],
+        "checked_citations": [
+          "https://sar.ku.edu/refunds"
+        ]
+      },
+      "after": {
+        "attempts": [],
+        "checked_citations": []
+      }
+    },
+    "Q099": {
+      "base": {
+        "attempts": [
+          {
+            "tools": [
+              "file_search"
+            ],
+            "total_text_tokens": 1363,
+            "system_text_tokens": 1321,
+            "schedule_text_tokens": 19,
+            "history_text_tokens": 6,
+            "question_text_tokens": 7
+          },
+          {
+            "tools": [
+              "web_search"
+            ],
+            "total_text_tokens": 1170,
+            "system_text_tokens": 1128,
+            "schedule_text_tokens": 19,
+            "history_text_tokens": 6,
+            "question_text_tokens": 7
+          }
+        ],
+        "checked_citations": []
+      },
+      "after": {
+        "attempts": [],
+        "checked_citations": [
+          "https://www.ku.edu.kw/ar/new-student-journey"
+        ]
+      }
+    },
+    "H01": {
+      "base": {
+        "attempts": [
+          {
+            "tools": [
+              "file_search"
+            ],
+            "total_text_tokens": 1362,
+            "system_text_tokens": 1321,
+            "schedule_text_tokens": 19,
+            "history_text_tokens": 0,
+            "question_text_tokens": 12
+          },
+          {
+            "tools": [
+              "web_search"
+            ],
+            "total_text_tokens": 1169,
+            "system_text_tokens": 1128,
+            "schedule_text_tokens": 19,
+            "history_text_tokens": 0,
+            "question_text_tokens": 12
+          }
+        ],
+        "checked_citations": []
+      },
+      "after": {
+        "attempts": [],
+        "checked_citations": []
+      }
+    },
+    "H05": {
+      "base": {
+        "attempts": [
+          {
+            "tools": [
+              "file_search"
+            ],
+            "total_text_tokens": 2037,
+            "system_text_tokens": 1321,
+            "schedule_text_tokens": 700,
+            "history_text_tokens": 0,
+            "question_text_tokens": 6
+          },
+          {
+            "tools": [
+              "web_search"
+            ],
+            "total_text_tokens": 1844,
+            "system_text_tokens": 1128,
+            "schedule_text_tokens": 700,
+            "history_text_tokens": 0,
+            "question_text_tokens": 6
+          }
+        ],
+        "checked_citations": []
+      },
+      "after": {
+        "attempts": [
+          {
+            "tools": [],
+            "total_text_tokens": 2093,
+            "system_text_tokens": 1377,
+            "schedule_text_tokens": 700,
+            "history_text_tokens": 0,
+            "question_text_tokens": 6
+          }
+        ],
+        "checked_citations": []
+      }
+    },
+    "H06": {
+      "base": {
+        "attempts": [
+          {
+            "tools": [],
+            "total_text_tokens": 2038,
+            "system_text_tokens": 1318,
+            "schedule_text_tokens": 700,
+            "history_text_tokens": 0,
+            "question_text_tokens": 10
+          }
+        ],
+        "checked_citations": []
+      },
+      "after": {
+        "attempts": [
+          {
+            "tools": [],
+            "total_text_tokens": 1414,
+            "system_text_tokens": 1374,
+            "schedule_text_tokens": 20,
+            "history_text_tokens": 0,
+            "question_text_tokens": 10
+          }
+        ],
+        "checked_citations": []
+      }
+    },
+    "T07": {
+      "base": {
+        "attempts": [
+          {
+            "tools": [
+              "file_search"
+            ],
+            "total_text_tokens": 2038,
+            "system_text_tokens": 1321,
+            "schedule_text_tokens": 700,
+            "history_text_tokens": 0,
+            "question_text_tokens": 7
+          },
+          {
+            "tools": [
+              "web_search"
+            ],
+            "total_text_tokens": 1845,
+            "system_text_tokens": 1128,
+            "schedule_text_tokens": 700,
+            "history_text_tokens": 0,
+            "question_text_tokens": 7
+          }
+        ],
+        "checked_citations": []
+      },
+      "after": {
+        "attempts": [
+          {
+            "tools": [],
+            "total_text_tokens": 2094,
+            "system_text_tokens": 1377,
+            "schedule_text_tokens": 700,
+            "history_text_tokens": 0,
+            "question_text_tokens": 7
+          }
+        ],
+        "checked_citations": []
+      }
+    }
+  }
+}

@@ -53,8 +53,8 @@ async def evaluate(case):
 
     attempts = []
     async def stream(messages, prompt, tools=None):
-        schedule = re.search(r"<student_schedule_data>\s*(.*?)\s*</student_schedule_data>", prompt, re.S)
-        context = re.search(r"<user_provided_context>\s*(.*?)\s*</user_provided_context>", prompt, re.S)
+        schedule = re.search(r"^<student_schedule_data>\n(.*?)\n</student_schedule_data>$", prompt, re.M | re.S)
+        context = re.search(r"^<user_provided_context>\n(.*?)\n</user_provided_context>$", prompt, re.M | re.S)
         system_text = prompt
         if schedule:
             system_text = system_text.replace(schedule.group(0), "", 1)
@@ -77,7 +77,7 @@ async def evaluate(case):
         coro.close()
 
     history = [{"isUser": True, "content": text} for text in case.get("prior", [])]
-    schedules = SCHEDULES if case["id"] in case.get("with_schedule", case["id"] in {"H05", "H06"}) else []
+    schedules = SCHEDULES if case.get("with_schedule", case["id"] in {"H05", "H06"}) else []
     cal.clear_calendar_content_cache()
     with ExitStack() as stack:
         for name, mock in {
