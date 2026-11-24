@@ -70,11 +70,11 @@ async def import_schedule(
     try:
         extraction = await extract_schedule(pdf_bytes, filename)
     except Exception as exc:
-        logger.exception("Schedule extraction failed for user %s: %s", uid, exc)
+        logger.warning("Schedule extraction failed (%s)", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="The schedule could not be analyzed. Please try again.",
-        ) from exc
+        ) from None
 
     extraction_payload = extraction.model_dump(mode="json")
     if not extraction.isValid:

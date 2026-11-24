@@ -73,10 +73,9 @@ async def lifespan(app: FastAPI):
     try:
         cfg = get_config()
         logger.info(
-            "Config OK — model=%s  schedule_model=%s  vector_store=%s  history_budget=%d",
+            "Config OK — model=%s  schedule_model=%s  history_budget=%d",
             cfg.OPENAI_MODEL,
             cfg.OPENAI_SCHEDULE_MODEL,
-            cfg.OPENAI_VECTOR_STORE_ID,
             cfg.HISTORY_TOKEN_BUDGET,
         )
         init_firebase()
@@ -86,8 +85,8 @@ async def lifespan(app: FastAPI):
         if distributed_enabled() and not await redis_ready():
             raise RuntimeError("Redis coordination is enabled but unavailable")
     except Exception as e:
-        logger.error(f"Startup validation failed: {e}")
-        raise
+        logger.error("Startup validation failed (%s)", type(e).__name__)
+        raise RuntimeError("Startup validation failed") from None
 
     # Notification recovery is deliberately outside fail-fast dependency
     # validation. Firestore/OpenAI recovery outages must not take chat/RAG down.
@@ -202,7 +201,7 @@ async def ready():
             raise RuntimeError("Redis coordination unavailable")
         return {"status": "ready"}
     except Exception as e:
-        logger.error(f"Readiness check failed: {e}")
+        logger.error("Readiness check failed (%s)", type(e).__name__)
         from fastapi import HTTPException
         raise HTTPException(status_code=503, detail="Service not ready")
 
@@ -222,13 +221,19 @@ async def capacity_metrics(request: Request):
         async with runtime.client.pipeline(transaction=False) as pipe:
             pipe.zcount(runtime.capacity.active_key, now, "+inf")
             pipe.zcount(runtime.capacity.queue_key, now, "+inf")
+            pipe.zrangebyscore(
+                runtime.capacity.queue_key, now, "+inf", start=0, num=1, withscores=True,
+            )
             pipe.zcount(f"{runtime.requests.prefix}:sse", now, "+inf")
             pipe.info("clients")
-            active, queued, subscribers, clients = await pipe.execute()
+            active, queued, oldest, subscribers, clients = await pipe.execute()
     except Exception:
         raise HTTPException(503, "Coordination metrics unavailable") from None
     values = {
         "kuniv_generations_active": active, "kuniv_queue_depth": queued,
+        "kuniv_queue_oldest_wait_seconds": (
+            max(0.0, runtime.capacity.wait_seconds - (oldest[0][1] - now) / 1000) if oldest else 0.0
+        ),
         "kuniv_sse_subscribers": subscribers,
         "kuniv_redis_connected_clients": clients["connected_clients"],
         "kuniv_redis_blocked_clients": clients["blocked_clients"],

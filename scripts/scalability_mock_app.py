@@ -7,7 +7,7 @@ import sqlite3
 import time
 from uuid import UUID
 import traceback
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 
 from fastapi import FastAPI, Request
 from slowapi import _rate_limit_exceeded_handler
@@ -82,7 +82,7 @@ async def mock_identity(request: Request):
 
 
 def durable_claim(uid, session, key, token, fingerprint):
-    with sqlite3.connect(os.environ["KUNIV_MOCK_CLAIMS_DB"], timeout=5) as db:
+    with closing(sqlite3.connect(os.environ["KUNIV_MOCK_CLAIMS_DB"], timeout=5)) as db, db:
         inserted = db.execute(
             "INSERT OR IGNORE INTO claims VALUES (?, ?, ?, ?)", (uid, session, key, fingerprint),
         ).rowcount

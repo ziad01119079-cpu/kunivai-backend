@@ -88,6 +88,29 @@ from app.services.notification_service import (  # noqa: E402
 )
 
 
+class GenerationFenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_older_worker_cannot_overwrite_newer_response(self):
+        from app import chat_repository
+
+        db = AsyncClient(project=PROJECT_ID, credentials=AnonymousCredentials())
+        uid, session_id, correlation_id = [uuid.uuid4().hex for _ in range(3)]
+        try:
+            with patch.object(chat_repository, "_db", return_value=db):
+                await chat_repository.save_assistant_message(
+                    uid, session_id, "new owner", [], correlation_id, generation_fence=2,
+                )
+                await chat_repository.save_assistant_message(
+                    uid, session_id, "stale owner", [], correlation_id, generation_fence=1,
+                )
+            row = await db.document(
+                f"users/{uid}/chats/{session_id}/messages/{correlation_id}-assistant"
+            ).get()
+            assert row.to_dict()["content"] == "new owner"
+            assert row.to_dict()["generationFence"] == 2
+        finally:
+            db.close()
+
+
 class FakeFcmSender:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error

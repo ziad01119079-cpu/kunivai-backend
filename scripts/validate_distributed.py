@@ -2,7 +2,7 @@
 
 import argparse
 import asyncio
-from contextlib import aclosing
+from contextlib import AsyncExitStack, aclosing, closing
 import json
 import math
 import os
@@ -316,7 +316,7 @@ async def run(args, directory):
     redis = Redis.from_url(redis_url, socket_connect_timeout=0.3, socket_timeout=2)
     run_id = str(uuid4())
     claims_db = directory / "claims.sqlite3"
-    with sqlite3.connect(claims_db) as db:
+    with closing(sqlite3.connect(claims_db)) as db, db:
         db.execute("CREATE TABLE claims(uid, session, message, fingerprint, PRIMARY KEY(uid, session, message))")
     env = dict(
         os.environ, KUNIV_LOCAL_MOCK="1", COORDINATION_BACKEND="redis",
@@ -389,7 +389,7 @@ async def run(args, directory):
 
                 for url, api in zip(urls, apis):
                     await wait_for(lambda: ready(url), api)
-                if args.uvicorn_workers > 1:
+                if args.uvicorn_workers > 1 and args.waves:
                     async with httpx.AsyncClient(
                         trust_env=False, limits=httpx.Limits(max_keepalive_connections=0),
                     ) as probe_client:
@@ -405,6 +405,35 @@ async def run(args, directory):
                             await asyncio.sleep(0.25)
                         assert len(worker_ids) == args.uvicorn_workers
                     print(f"PASS shared Uvicorn listener served by {len(worker_ids)} worker PIDs", flush=True)
+                if args.uvicorn_workers > 1 and not args.waves:
+                    async with AsyncExitStack() as stack:
+                        by_worker = {}
+                        deadline = time.monotonic() + 90
+                        target = f"{urls[0]}/__mock/stats"
+                        while len(by_worker) < args.uvicorn_workers and time.monotonic() < deadline:
+                            peers = [httpx.AsyncClient(
+                                trust_env=False, limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+                            ) for _ in range(16)]
+                            probes = await asyncio.gather(*(peer.get(target) for peer in peers), return_exceptions=True)
+                            for probe, peer in zip(probes, peers):
+                                pid = None if isinstance(probe, BaseException) else probe.headers.get("X-Test-Worker")
+                                if pid and pid not in by_worker:
+                                    by_worker[pid] = peer
+                                    stack.push_async_callback(peer.aclose)
+                                else:
+                                    await peer.aclose()
+                            await asyncio.gather(*(peer.get(target) for peer in by_worker.values()))
+                            await asyncio.sleep(0.25)
+                        assert len(by_worker) == args.uvicorn_workers, "Could not pin distinct worker connections"
+                        retry_key = str(uuid4())
+                        pair = await asyncio.gather(*(
+                            collect(peer, urls[0], retry_key) for peer in list(by_worker.values())[:2]
+                        ))
+                        assert pair[0][0][0] != pair[1][0][0]
+                        assert pair[0][-1][2]["type"] == "done"
+                        assert [row[1:] for row in pair[0]] == [row[1:] for row in pair[1]]
+                        assert int(await redis.hget("kuniv-validation:mock:calls", retry_key)) == 1
+                    print(f"PASS {len(by_worker)} distinct worker PIDs and cross-worker coalescing", flush=True)
                 key = str(uuid4())
                 left, right = await asyncio.gather(*(collect(client, url, key) for url in (urls[0], urls[-1])))
                 assert left and left[-1][2]["type"] == "done", (left, right)
@@ -442,6 +471,18 @@ async def run(args, directory):
                     apis[0] = start_api(ports[0])
                     await wait_for(lambda: ready(urls[0]), apis[0])
                     print("PASS worker kill, takeover reset, no second generation and stale terminal rejected", flush=True)
+                    if os.name == "posix" and not args.waves:
+                        drain_key = str(uuid4())
+                        async with aclosing(events(client, urls[0], drain_key)) as stream:
+                            _, drain_cursor, _ = await anext(stream)
+                            apis[0].terminate()
+                        assert await asyncio.to_thread(apis[0].wait, 15) in (0, -15)
+                        drained = await collect(client, urls[-1], drain_key, cursor=drain_cursor)
+                        assert [item[2]["type"] for item in drained] == ["chunk"] * 8 + ["done"]
+                        assert int(await redis.hget("kuniv-validation:mock:calls", drain_key)) == 1
+                        apis[0] = start_api(ports[0])
+                        await wait_for(lambda: ready(urls[0]), apis[0])
+                        print("PASS graceful SIGTERM, peer replay and replacement listener readiness", flush=True)
                 interrupted_key = str(uuid4())
                 async with aclosing(events(client, urls[0], interrupted_key, message="kill-owner")) as stream:
                     _, interrupted_cursor, initial = await anext(stream)

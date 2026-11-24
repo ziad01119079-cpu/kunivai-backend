@@ -1,6 +1,5 @@
 import asyncio
 import importlib
-import json
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -15,6 +14,47 @@ from app.services.distributed_coordination import (
 from app.services.provider_transport import BudgetedProviderTransport
 
 route = importlib.import_module("app.routers.chat")
+
+
+def test_capacity_metrics_require_token_and_report_queue_age(monkeypatch):
+    import main
+
+    class MetricsRedis(fakeredis.aioredis.FakeRedis):
+        def pipeline(self, *args, **kwargs):
+            pipe = super().pipeline(*args, **kwargs)
+            pipe.info = lambda _: pipe.hgetall("test:client-info")
+            return pipe
+
+    async def run():
+        async with MetricsRedis(decode_responses=True) as redis:
+            capacity = RedisCapacityGate(redis, prefix="test", limit=2, max_queued=2, wait_seconds=10, lease_ms=1000)
+            runtime = SimpleNamespace(client=redis, capacity=capacity, requests=SimpleNamespace(prefix="test"))
+
+            async def ready():
+                return True
+
+            monkeypatch.setenv("COORDINATION_BACKEND", "redis")
+            monkeypatch.setenv("KUNIV_METRICS_TOKEN", "local-test-credential")
+            monkeypatch.setattr(main, "redis_ready", ready)
+            monkeypatch.setattr(main, "get_redis_runtime", lambda: runtime)
+            seconds, micros = await redis.time()
+            now = seconds * 1000 + micros // 1000
+
+            async def sample_time():
+                return seconds, micros
+
+            monkeypatch.setattr(redis, "time", sample_time)
+            await redis.zadd(capacity.queue_key, {"expired": now - 5, "oldest": now + 4000, "newer": now + 7000})
+            await redis.hset("test:client-info", mapping={"connected_clients": 3, "blocked_clients": 1})
+            async with httpx.AsyncClient(base_url="http://test", transport=httpx.ASGITransport(app=main.app)) as client:
+                assert (await client.get("/internal/capacity")).status_code == 404
+                response = await client.get("/internal/capacity", headers={"Authorization": "Bearer local-test-credential"})
+                assert response.status_code == 200
+                values = dict(line.split() for line in response.text.splitlines())
+                assert values["kuniv_queue_depth"] == "2"
+                assert values["kuniv_queue_oldest_wait_seconds"] == "6.0"
+
+    asyncio.run(run())
 
 
 def test_chat_identity_fairness_and_loss_does_not_regenerate(monkeypatch):
