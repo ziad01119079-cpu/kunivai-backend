@@ -96,6 +96,25 @@ local function epoch_valid(key, expected)
 end
 """
 
+CHAT_ADMISSION_LUA = EPOCH_LUA + """
+if not epoch_valid(KEYS[3], ARGV[5]) then return {-1, 0} end
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local window = tonumber(ARGV[1])
+for i = 1, 2 do
+  redis.call('ZREMRANGEBYSCORE', KEYS[i], '-inf', now - window)
+  if redis.call('ZCARD', KEYS[i]) >= tonumber(ARGV[i + 1]) then
+    local oldest = redis.call('ZRANGE', KEYS[i], 0, 0, 'WITHSCORES')[2]
+    return {i, math.max(1, tonumber(oldest) + window - now)}
+  end
+end
+for i = 1, 2 do
+  redis.call('ZADD', KEYS[i], now, ARGV[4])
+  redis.call('PEXPIRE', KEYS[i], window)
+end
+return {0, 0}
+"""
+
 ROLLING_BUDGET_LUA = EPOCH_LUA + """
 if not epoch_valid(KEYS[3], ARGV[6]) then return {-1, 0} end
 local clock = redis.call('TIME')
@@ -397,6 +416,28 @@ class RedisUserRateLimiter:
         key = f"{self.prefix}:rate:user:{hashlib.sha256(uid.encode()).hexdigest()}"
         delay = int(await self.redis.eval(RATE_LIMIT_LUA, 1, key, self.window_ms, self.requests, uuid.uuid4().hex))
         return (delay + 999) // 1000 if delay else None
+
+
+class RedisChatAdmission:
+    def __init__(self, redis, *, prefix: str, user_rpm: int, global_rpm: int, epoch_key: str, epoch: str):
+        if min(user_rpm, global_rpm) < 1:
+            raise ValueError("Chat request budgets must be positive")
+        self.redis = redis
+        self.prefix = f"{prefix}:chat-admission"
+        self.user_rpm, self.global_rpm = user_rpm, global_rpm
+        self.epoch_key, self.epoch = epoch_key, epoch
+
+    async def reserve(self, uid: str) -> tuple[str, int] | None:
+        digest = hashlib.sha256(uid.encode()).hexdigest()
+        code, delay = await self.redis.eval(
+            CHAT_ADMISSION_LUA, 3, f"{self.prefix}:{digest}", f"{self.prefix}:global", self.epoch_key,
+            60_000, self.user_rpm, self.global_rpm, uuid.uuid4().hex, self.epoch,
+        )
+        if code == -1:
+            raise RedisError("Coordination epoch missing or changed")
+        if code:
+            return ("AI_USER_RATE_LIMITED" if code == 1 else "AI_GLOBAL_RATE_LIMITED", (delay + 999) // 1000)
+        return None
 
 
 class RedisOpenAIBudget:

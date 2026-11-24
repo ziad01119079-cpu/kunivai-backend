@@ -74,21 +74,25 @@ async def chat(
         )
 
     distributed = distributed_enabled()
-    if distributed and body.client_message_id is None:
-        raise HTTPException(422, "client_message_id is required")
+    cursor = request.headers.get("last-event-id", "0-0")
+    if distributed:
+        if not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", cursor) or any(
+            int(part) >= 2**64 for part in cursor.split("-")
+        ):
+            raise HTTPException(400, "Invalid Last-Event-ID")
+        if cursor != "0-0" and body.client_message_id is None:
+            raise HTTPException(422, "client_message_id is required to resume")
     await verify_chat_app_check(request.headers.get("x-firebase-appcheck"))
     message_id = body.client_message_id or str(uuid.uuid4())
-    retry_after = None
+    rejection = None
     try:
         if distributed:
             runtime = get_redis_runtime()
-            if runtime.epoch and not await runtime.epoch_ready():
-                raise RedisError("Coordination epoch missing or changed")
-            retry_after = await runtime.users.check(uid)
+            rejection = await runtime.admission.reserve(uid)
         else:
             await chat_user_rate_limiter.check(uid)
     except UserRateLimitExceeded as exc:
-        retry_after = exc.retry_after
+        rejection = ("AI_USER_RATE_LIMITED", exc.retry_after)
     except RedisError:
         logger.warning("Distributed chat admission unavailable")
         return JSONResponse(
@@ -97,15 +101,16 @@ async def chat(
             content={"code": "AI_COORDINATION_UNAVAILABLE", "retryable": True,
                      "message": "الخدمة غير متاحة مؤقتاً. حاول مرة أخرى بعد قليل."},
         )
-    if retry_after is not None:
+    if rejection is not None:
+        code, retry_after = rejection
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             headers={"Retry-After": str(retry_after)},
             content={
-                "code": "AI_USER_RATE_LIMITED",
+                "code": code,
                 "retryable": True,
                 "retry_after_seconds": retry_after,
-                "message": "تم تجاوز حد طلبات المحادثة. حاول مرة أخرى لاحقاً.",
+                "message": "الخدمة مشغولة مؤقتًا. حاول مرة أخرى بعد قليل.",
             },
         )
 
@@ -117,11 +122,6 @@ async def chat(
         )
 
     if distributed:
-        cursor = request.headers.get("last-event-id", "0-0")
-        if not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,20}", cursor) or any(
-            int(part) >= 2**64 for part in cursor.split("-")
-        ):
-            raise HTTPException(400, "Invalid Last-Event-ID")
         request_key = f"{uid}:{session_id}:{message_id}"
         fingerprint = hashlib.sha256(
             json.dumps([message, body.systemContext], ensure_ascii=False).encode()
@@ -130,9 +130,6 @@ async def chat(
         async def authorized_generation():
             try:
                 async with asyncio.timeout(float(os.getenv("AI_GENERATION_TIMEOUT_SECONDS", "120"))):
-                    if await runtime.starts.reserve(0) is not None:
-                        yield RedisCoordinator._error("AI_GLOBAL_RATE_LIMITED", "الخدمة مشغولة. حاول بعد قليل.")
-                        return
                     token = uuid.uuid4().hex
                     result = await claim_generation(uid, session_id, message_id, token, fingerprint)
                     if result == "conflict":
@@ -167,5 +164,6 @@ async def chat(
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",   # Nginx: disable buffering
+            "X-Client-Message-ID": message_id,
         },
     )

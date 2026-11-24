@@ -1,0 +1,14 @@
+# Build from committed source and an ARM64 dependency lock on the off-host builder.
+ARG PYTHON_BASE=docker.io/library/python@sha256:0c62af2243181e03e0725d7e69b09e5509fdf843d7d84d88b53b4617945ab02a
+FROM ${PYTHON_BASE}
+ARG REVISION
+LABEL org.opencontainers.image.revision=${REVISION}
+WORKDIR /app
+ENV PYTHONPATH=/opt/kuniv/site-packages PYTHONUNBUFFERED=1 HOME=/tmp \
+    KUNIV_SCALABLE=1 COORDINATION_BACKEND=redis
+COPY --chown=65532:65532 target /opt/kuniv/site-packages
+COPY --chown=65532:65532 app /app/app
+COPY --chown=65532:65532 main.py /app/main.py
+USER 65532:65532
+EXPOSE 8080
+CMD ["python", "-m", "uvicorn", "app.worker_bootstrap:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--limit-concurrency", "192", "--timeout-graceful-shutdown", "25"]

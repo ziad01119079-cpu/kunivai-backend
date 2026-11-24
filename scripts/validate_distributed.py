@@ -328,6 +328,7 @@ async def run(args, directory):
         AI_MAX_QUEUED_GENERATIONS=str(args.queued),
         AI_QUEUE_TIMEOUT_SECONDS=os.environ.get("AI_QUEUE_TIMEOUT_SECONDS", "2"),
         AI_IP_RATE_LIMIT="1000000/minute", AI_USER_RATE_LIMIT_REQUESTS="100",
+        AI_GLOBAL_GENERATION_RPM=os.environ.get("AI_GLOBAL_GENERATION_RPM", "1000000"),
         REDIS_SOCKET_TIMEOUT_SECONDS="10",
     )
     children = []

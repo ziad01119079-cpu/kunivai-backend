@@ -8,6 +8,7 @@ from functools import lru_cache
 
 from .distributed_coordination import (
     RedisCapacityGate,
+    RedisChatAdmission,
     RedisCoordinator,
     RedisOpenAIBudget,
     RedisSubscriberGate,
@@ -22,9 +23,8 @@ class RedisRuntime:
     reader: object
     requests: RedisCoordinator
     capacity: RedisCapacityGate
-    users: RedisUserRateLimiter
+    admission: RedisChatAdmission
     openai_budget: RedisOpenAIBudget
-    starts: RedisOpenAIBudget
     subscribers: RedisSubscriberGate
     epoch_key: str
     epoch: str
@@ -86,19 +86,15 @@ def get_redis_runtime() -> RedisRuntime:
             per_user=int(os.getenv("AI_MAX_GENERATIONS_PER_USER", "2")),
             queued_per_user=int(os.getenv("AI_MAX_QUEUED_PER_USER", "2")),
         ),
-        users=RedisUserRateLimiter(
-            client, prefix=prefix,
-            requests=int(os.getenv("AI_USER_RATE_LIMIT_REQUESTS", "20")),
-            window_seconds=int(os.getenv("AI_USER_RATE_LIMIT_WINDOW_SECONDS", "60")),
+        admission=RedisChatAdmission(
+            client, prefix=prefix, epoch_key=epoch_key, epoch=epoch,
+            user_rpm=int(os.getenv("AI_USER_RATE_LIMIT_REQUESTS", "10")),
+            global_rpm=int(os.getenv("AI_GLOBAL_GENERATION_RPM", "30")),
         ),
         openai_budget=RedisOpenAIBudget(
             client, prefix=f"{prefix}:provider", epoch=epoch, epoch_key=epoch_key,
             rpm=min(5000, int(os.getenv("OPENAI_RPM_BUDGET", "5000"))),
             tpm=min(450000, int(os.getenv("OPENAI_TPM_BUDGET", "450000"))),
-        ),
-        starts=RedisOpenAIBudget(
-            client, prefix=f"{prefix}:generation-start", epoch=epoch, epoch_key=epoch_key,
-            rpm=int(os.getenv("AI_GLOBAL_GENERATION_RPM", "300")), tpm=1,
         ),
         subscribers=RedisSubscriberGate(
             client, prefix=prefix, local_limit=local_sse,

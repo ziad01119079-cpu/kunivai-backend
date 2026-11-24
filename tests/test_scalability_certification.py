@@ -9,7 +9,7 @@ from fastapi import FastAPI
 
 from app.auth import verify_chat_app_check, verify_token
 from app.services.distributed_coordination import (
-    RedisCapacityGate, RedisCoordinator, RedisOpenAIBudget, RedisSubscriberGate, RedisUserRateLimiter,
+    RedisCapacityGate, RedisChatAdmission, RedisCoordinator, RedisOpenAIBudget, RedisSubscriberGate,
 )
 from app.services.provider_transport import BudgetedProviderTransport
 
@@ -62,11 +62,12 @@ def test_chat_identity_fairness_and_loss_does_not_regenerate(monkeypatch):
         redis = fakeredis.aioredis.FakeRedis()
         runtime = SimpleNamespace(
             client=redis, epoch="", epoch_key="test:epoch",
-            users=RedisUserRateLimiter(redis, prefix="test", requests=30, window_seconds=60),
+            admission=RedisChatAdmission(
+                redis, prefix="test", user_rpm=4, global_rpm=5, epoch_key="test:epoch", epoch="",
+            ),
             requests=RedisCoordinator(redis, prefix="test"),
             capacity=RedisCapacityGate(redis, prefix="test", limit=2, max_queued=2, wait_seconds=1, lease_ms=1000),
             subscribers=RedisSubscriberGate(redis, prefix="test", limit=8, per_user=4, local_limit=8, seconds=5),
-            starts=RedisOpenAIBudget(redis, prefix="test:starts", rpm=2, tpm=1),
         )
         durable = {}
         calls = []
@@ -99,18 +100,25 @@ def test_chat_identity_fairness_and_loss_does_not_regenerate(monkeypatch):
             httpx.AsyncClient(base_url="http://test", transport=httpx.ASGITransport(app=first)) as a,
             httpx.AsyncClient(base_url="http://test", transport=httpx.ASGITransport(app=second)) as b,
         ):
-            assert (await a.post("/chat", json=body)).status_code == 422
+            assert (await a.post("/chat", json=body, headers={"Last-Event-ID": "1-0"})).status_code == 422
             assert (await a.post("/chat", json={**body, "client_message_id": "invalid"})).status_code == 422
+            legacy = await a.post("/chat", json=body)
+            assert legacy.status_code == 200 and '"done"' in legacy.text
+            assert legacy.headers["X-Client-Message-ID"] == calls[0]["correlation_id"]
             body["client_message_id"] = str(uuid4())
             one, replay = await asyncio.gather(*(a.post("/chat", json=body) for _ in range(2)))
             assert one.text == replay.text and '"done"' in one.text
             assert "MESSAGE_ID_CONFLICT" in (await a.post("/chat", json={**body, "message": "other"})).text
             assert '"done"' in (await b.post("/chat", json=body)).text
-            assert "AI_GLOBAL_RATE_LIMITED" in (await a.post("/chat", json={**body, "client_message_id": str(uuid4())})).text
+            over_user = await a.post("/chat", json=body)
+            assert over_user.status_code == 429 and over_user.json()["code"] == "AI_USER_RATE_LIMITED"
+            over_global = await b.post("/chat", json=body)
+            assert over_global.status_code == 429 and over_global.json()["code"] == "AI_GLOBAL_RATE_LIMITED"
+            assert 1 <= int(over_global.headers["Retry-After"]) <= 60
             # Simulate complete Redis loss. The separate durable record survives.
             await redis.flushdb()
             assert "GENERATION_OUTCOME_UNKNOWN" in (await a.post("/chat", json=body)).text
-            assert len(calls) == 2 and all(c.get("generation_claim") for c in calls)
+            assert len(calls) == 3 and all(c.get("generation_claim") for c in calls)
         await redis.aclose()
 
     asyncio.run(run())
