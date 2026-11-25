@@ -65,6 +65,18 @@ class Config:
         self.OPENAI_TIMEOUT = float(
             os.getenv("OPENAI_TIMEOUT", "60.0")
         )
+        # ── Community Knowledge (disabled by default, fail-closed) ────────
+        self.COMMUNITY_INGESTION_ENABLED = os.getenv(
+            "COMMUNITY_INGESTION_ENABLED", "false"
+        ).strip().lower() in {"true", "1", "yes"}
+        self.COMMUNITY_RAG_ENABLED = os.getenv(
+            "COMMUNITY_RAG_ENABLED", "false"
+        ).strip().lower() in {"true", "1", "yes"}
+        self.COMMUNITY_FAIL_CLOSED = os.getenv(
+            "COMMUNITY_FAIL_CLOSED", "true"
+        ).strip().lower() not in {"false", "0", "no"}
+        raw_min_conf = float(os.getenv("COMMUNITY_SOURCE_MIN_CONFIDENCE", "0.0"))
+        self.COMMUNITY_SOURCE_MIN_CONFIDENCE = max(0.0, min(1.0, raw_min_conf))
 
 
 def _require(key: str) -> str:
