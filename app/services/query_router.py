@@ -123,6 +123,18 @@ _TIME_SENSITIVE_UNIVERSITY_TOPICS = (
     r"(?:announcement|news|update|post|official account).{0,80}(?:kuwait university|\bku\b|instagram|twitter|\bx\b)",
 )
 
+# Explicit policy requests take precedence over possessives such as "تخصصي".
+_POLICY_REQUESTS = (
+    r"(?:تغيير|تبديل|اغير|أغير|اغيّر|أغيّر|احول|أحول|التحويل).{0,25}(?:تخصصي|التخصص|كلية|كليتي)",
+    r"(?:تخصصي|كليتي).{0,35}(?:الضوابط|الشروط|الاجراءات|الإجراءات)",
+    r"(?:كم|متى).{0,20}(?:الإنذارات|الانذارات).{0,28}(?:الفصل|المسموح)",
+    r"(?:change|switch|transfer).{0,20}my (?:major|college)",
+    r"(?:التشغيل الطلابي|توظيف الطلبة|(?:السكن|الاسكان|الإسكان) الطلابي|صندوق الطلبة|المدة الاعتيادية للتخرج|التحويل الداخلي|التخصص النادر|التخصصات النادرة|التبادل الطلابي|النقل الجامعي|الباص الجامعي|student employment|student housing)",
+    r"(?:شروط|ضوابط|لائحة|قواعد|عقوبة|عقوبات|عند الجامعة|جامعة الكويت).{0,45}(?:الانذار|الإنذار|الغش|العبء الدراسي|تأجيل (?:الاختبار|الامتحان)|الصيفي)",
+    r"(?:الانذار|الإنذار|الغش|العبء الدراسي|تأجيل (?:الاختبار|الامتحان)|الصيفي).{0,40}(?:شروط|ضوابط|لائحة|قواعد|عقوبة|عقوبات|جامعة الكويت)",
+)
+
+
 _OFFICIAL_PATTERNS = (
     r"(?:شروط|موعد|مواعيد|فترة|قرار|لائحة|قانون|سياسة|إعلان|اعلان).{0,30}(?:القبول|التسجيل|السحب|الوقف|الإيقاف|الايقاف|المكافأة|المكافاه|البعثة|المنحة|الرسوم)",
     r"(?:متى|يفتح|يبدأ|ينتهي).{0,25}(?:القبول|التسجيل|السحب|الإضافة|الاضافة|المنحة|البعثة)",
@@ -187,6 +199,11 @@ def _normalize(user_message: str) -> str:
     return " ".join(text.split())
 
 
+def is_explicit_policy_request(question: str) -> bool:
+    text = re.sub(r"[\u064b-\u065f]", "", _normalize(question))
+    return _matches_any(_POLICY_REQUESTS, text)
+
+
 def is_user_schedule_query(user_message: str) -> bool:
     """Return True for questions about the authenticated user's own data."""
     text = _normalize(user_message)
@@ -217,10 +234,12 @@ def is_general_academic_explanation(question: str) -> bool:
 def classify_query(user_message: str) -> QueryIntent:
     """Classify a request without adding model latency or token cost."""
     text = _normalize(user_message)
-    if is_user_schedule_query(text):
-        return QueryIntent.PERSONAL_SCHEDULE
     if is_general_academic_explanation(text):
         return QueryIntent.GENERAL_EDUCATIONAL
+    if is_explicit_policy_request(text):
+        return QueryIntent.OFFICIAL_UNIVERSITY
+    if is_user_schedule_query(text):
+        return QueryIntent.PERSONAL_SCHEDULE
     if text in _CASUAL_EXACT or _matches_any(_CONVERSATIONAL_FOLLOW_UP_PATTERNS, text):
         return QueryIntent.CASUAL_UNIVERSITY
     if is_time_sensitive_query(text):
@@ -260,7 +279,7 @@ def contextual_query_intent(question: str, prior_messages_desc: list[dict]) -> Q
     if _FILE_REFERENCE.search(text):
         return QueryIntent.PERSONAL_SCHEDULE
     intent = classify_query(question)
-    if not _CONTEXTUAL.search(text):
+    if intent in {QueryIntent.OFFICIAL_UNIVERSITY, QueryIntent.TIME_SENSITIVE_UNIVERSITY} or not _CONTEXTUAL.search(text):
         return intent
     previous = next((str(row.get("content", "")) for row in prior_messages_desc if row.get("isUser", True)), "")
     prior_intent = classify_query(previous)

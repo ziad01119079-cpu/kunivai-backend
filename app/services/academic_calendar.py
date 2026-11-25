@@ -74,6 +74,9 @@ class Semester(str, Enum):
     SUMMER = "summer"
 
 
+LAW_GUIDANCE_URL = "https://law.ku.edu.kw/ar/students/guidance-and-counseling"
+
+
 class CollegeScope(str, Enum):
     GENERAL = "general"
     LAW = "law"
@@ -1144,7 +1147,7 @@ def format_calendar_answer(
         answer += ("\n\nThe applicable official calendar contains conflicting date information." if english else
                    "\n\nيتضمن التقويم الرسمي المطبق بيانات متعارضة عن الموعد.")
     if query.college_scope is CollegeScope.LAW:
-        contact = "https://law.ku.edu.kw/ar/students/guidance-and-counseling"
+        contact = LAW_GUIDANCE_URL
         answer += (f"\n\nAsk the [Law guidance office]({contact}) for the applicable timetable." if english else
                    f"\n\nللحصول على الجدول المطبق، تواصل مع [مكتب التوجيه والإرشاد بكلية الحقوق]({contact}).")
     else:

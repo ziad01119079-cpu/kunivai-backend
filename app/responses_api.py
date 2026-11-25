@@ -30,6 +30,8 @@ from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 from .config import get_config
 from .openai_client import get_openai_client
 from .services.coordination_runtime import distributed_enabled
+from .services.model_policy import effective_max_output_tokens, reasoning_for
+from .services.stream_citations import StreamCitations
 from .services.response_policy import has_previous_answer, response_policy_for
 from .services.provider_usage import ProviderAttempt, input_breakdown
 
@@ -91,13 +93,17 @@ async def stream_response(
     system_prompt: str,
     tools: list[dict] | None = None,
     max_output_tokens: int | None = None,
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> AsyncIterator[str]:
     """Retry one known transient in-band provider failure before any text."""
     retry_reason = None
     for attempt in range(2):
         try:
             async with aclosing(_stream_response_once(
-                messages, system_prompt, tools, max_output_tokens, allow_retry=attempt == 0, retry_reason=retry_reason,
+                messages, system_prompt, tools, max_output_tokens, allow_retry=attempt == 0,
+                retry_reason=retry_reason, model=model, reasoning_effort=reasoning_effort,
             )) as stream:
                 async for item in stream:
                     yield item
@@ -116,6 +122,8 @@ async def _stream_response_once(
     *,
     allow_retry: bool,
     retry_reason: str | None,
+    model: str | None,
+    reasoning_effort: str | None,
 ) -> AsyncIterator[str]:
     """
     Async generator that yields SSE-formatted strings.
@@ -130,6 +138,8 @@ async def _stream_response_once(
     """
     client = get_openai_client()
     config = get_config()
+    model = model or config.OPENAI_MODEL
+    effort = reasoning_for(model, reasoning_effort)
 
     input_messages = [
         {"role": "system", "content": system_prompt},
@@ -142,9 +152,11 @@ async def _stream_response_once(
         policy = response_policy_for(question, previous_answer=has_previous_answer(prior))
         # Retrieval and citations can need room even when the visible answer
         # is short. These ceilings guard usage; the prompt sets the answer length.
-        max_output_tokens = max(policy.max_output_tokens, 850 if tools is None or tools else 0)
+        max_output_tokens = effective_max_output_tokens(policy, hosted_tools=tools is None or bool(tools), effort=effort)
 
     full_text_parts: list[str] = []
+    received_text = False
+    cleaner = StreamCitations()
     raw_citations: list[dict] = []   # file and URL citations
     evidence_texts: list[str] = []
     usage: dict | None = None
@@ -155,9 +167,9 @@ async def _stream_response_once(
     if tools is None:
         tools = [{"type": "file_search", "vector_store_ids": [config.OPENAI_VECTOR_STORE_ID]}]
     telemetry = ProviderAttempt(
-        config.OPENAI_MODEL,
+        model,
         "responses",
-        input_breakdown(messages, system_prompt, config.OPENAI_MODEL),
+        input_breakdown(messages, system_prompt, model),
         tuple(tool["type"] for tool in tools),
         retry_reason,
     )
@@ -166,11 +178,13 @@ async def _stream_response_once(
         logger.info("Starting Responses API stream")
 
         request_options = {
-            "model": config.OPENAI_MODEL,
+            "model": model,
             "input": input_messages,
             "tools": tools,
         }
         request_options["max_output_tokens"] = max_output_tokens
+        if effort is not None:
+            request_options["reasoning"] = {"effort": effort}
         if tools:
             request_options["tool_choice"] = "required"
             if distributed_enabled():
@@ -201,6 +215,8 @@ async def _stream_response_once(
                 # ── Text delta ──────────────────────────────────────────
                 if event_type == "response.output_text.delta":
                     delta: str = event.delta or ""
+                    received_text |= bool(delta)
+                    delta = cleaner.feed(delta)
                     if delta:
                         full_text_parts.append(delta)
                         yield (
@@ -210,17 +226,28 @@ async def _stream_response_once(
                         )
 
                 # ── Completed: collect file_search annotations ──────────
-                elif event_type == "response.completed":
-                    completed = True
-                    telemetry.outcome = "completed"
+                elif event_type in {"response.completed", "response.incomplete"}:
                     response = event.response
+                    completed = event_type == "response.completed" and getattr(response, "status", None) != "incomplete"
+                    telemetry.outcome = "completed" if completed else "incomplete"
+                    if not completed:
+                        details = getattr(response, "incomplete_details", None)
+                        incomplete_reason = getattr(details, "reason", None) or "unknown"
+                        if incomplete_reason not in {"max_output_tokens", "content_filter"}:
+                            incomplete_reason = "unknown"
+                    if tail := cleaner.feed("", final=True):
+                        full_text_parts.append(tail)
+                        yield "data: " + json.dumps({"type": "chunk", "content": tail}) + "\n\n"
                     response_usage = getattr(response, "usage", None)
                     if response_usage is not None:
                         usage = {
                             "prompt_tokens": getattr(response_usage, "input_tokens", 0),
                             "completion_tokens": getattr(response_usage, "output_tokens", 0),
                             "total_tokens": getattr(response_usage, "total_tokens", 0),
+                            "cached_tokens": getattr(getattr(response_usage, "input_tokens_details", None), "cached_tokens", None),
+                            "reasoning_tokens": getattr(getattr(response_usage, "output_tokens_details", None), "reasoning_tokens", None),
                         }
+                    part_offset = 0
                     for output in getattr(response, "output", None) or []:
                         if getattr(output, "type", None) == "file_search_call":
                             for result in getattr(output, "results", None) or []:
@@ -240,7 +267,7 @@ async def _stream_response_once(
                                             raw_citations.append(
                                                 {
                                                     "file_id": ann.file_id,
-                                                    "index": ann.index,
+                                                    "index": cleaner.visible_offset(part_offset + ann.index),
                                                     "filename": getattr(ann, "filename", None),
                                                 }
                                             )
@@ -253,24 +280,19 @@ async def _stream_response_once(
                                                     "type": "url_citation",
                                                     "url": ann.url,
                                                     "title": getattr(ann, "title", ann.url),
-                                                    "start_index": getattr(ann, "start_index", 0),
-                                                    "end_index": getattr(ann, "end_index", 0),
+                                                    "start_index": cleaner.visible_offset(part_offset + getattr(ann, "start_index", 0)),
+                                                    "end_index": cleaner.visible_offset(part_offset + getattr(ann, "end_index", 0)),
                                                 }
                                             )
 
-                elif event_type == "response.incomplete":
-                    response = event.response
-                    telemetry.outcome = "incomplete"
-                    details = getattr(response, "incomplete_details", None)
-                    incomplete_reason = str(
-                        getattr(details, "reason", None) or "unknown"
-                    )
+                                    part_offset += len(getattr(part, "text", "") or "")
+
                 elif event_type in {"error", "response.failed"}:
                     error = getattr(event.response, "error", None) if event_type == "response.failed" else event
                     code = _provider_code(error)
                     telemetry.outcome = code
-                    _log_provider_failure(code, provider_request_id, has_output=bool(full_text_parts))
-                    if allow_retry and not full_text_parts and code in _TRANSIENT_STREAM_CODES:
+                    _log_provider_failure(code, provider_request_id, has_output=received_text)
+                    if allow_retry and not received_text and code in _TRANSIENT_STREAM_CODES:
                         raise _RetryBeforeOutput(code)
                     yield _provider_error_event(
                         "LLM_RATE_LIMITED" if code == "rate_limit_exceeded" else "LLM_UNAVAILABLE",
@@ -282,7 +304,7 @@ async def _stream_response_once(
         raise
     except (TimeoutError, APITimeoutError):
         telemetry.outcome = "timeout"
-        _log_provider_failure("timeout", provider_request_id, has_output=bool(full_text_parts))
+        _log_provider_failure("timeout", provider_request_id, has_output=received_text)
         yield (
             "data: "
             + json.dumps({
@@ -301,7 +323,7 @@ async def _stream_response_once(
         request_id = provider_request_id or _provider_request_id(
             exc.response.headers if isinstance(exc, APIStatusError) else None
         )
-        _log_provider_failure(code, request_id, has_output=bool(full_text_parts), status=status)
+        _log_provider_failure(code, request_id, has_output=received_text, status=status)
         if isinstance(exc, APIStatusError) and code == "openai_budget_exhausted":
             yield "data: " + json.dumps({
                 "type": "error", "code": "OPENAI_BUDGET_EXHAUSTED",
@@ -311,7 +333,7 @@ async def _stream_response_once(
             return
         if (
             stream_opened and status is None and code in _TRANSIENT_STREAM_CODES
-            and allow_retry and not full_text_parts
+            and allow_retry and not received_text
         ):
             raise _RetryBeforeOutput(code) from None
         temporarily_limited = code == "rate_limit_exceeded" or (
@@ -335,17 +357,7 @@ async def _stream_response_once(
     finally:
         telemetry.finish()
 
-    if incomplete_reason is not None:
-        logger.warning("Responses API output incomplete: %s", incomplete_reason)
-        yield "data: " + json.dumps({
-            "type": "error",
-            "code": "OUTPUT_LIMIT_REACHED",
-            "retryable": False,
-            "reason": incomplete_reason,
-            "message": "توقفت الإجابة قبل اكتمالها بسبب حد الطول.",
-        }) + "\n\n"
-        return
-    if not completed:
+    if not completed and incomplete_reason is None:
         yield "data: " + json.dumps({
             "type": "error",
             "code": "LLM_STREAM_INTERRUPTED",
@@ -361,7 +373,10 @@ async def _stream_response_once(
     url_citations = [
         item for item in raw_citations if item.get("type") == "url_citation"
     ]
-    citations = await _resolve_citations(file_citations)
+    citations = await _resolve_citations(file_citations) if completed else [
+        Citation(file_id=item["file_id"], filename=item.get("filename") or item["file_id"], index=item["index"])
+        for item in file_citations
+    ]
 
     citation_list: list[dict] = [
         {
@@ -378,6 +393,23 @@ async def _stream_response_once(
             continue
         seen_urls.add(citation["url"])
         citation_list.append(citation)
+
+    if incomplete_reason is not None:
+        logger.warning("Responses API output incomplete: %s", incomplete_reason)
+        limited = incomplete_reason == "max_output_tokens"
+        yield "data: " + json.dumps({
+            "type": "error",
+            "code": "OUTPUT_LIMIT_REACHED" if limited else "LLM_RESPONSE_INCOMPLETE",
+            "retryable": False,
+            "reason": incomplete_reason,
+            "message": (
+                "توقفت الإجابة قبل اكتمالها بسبب حد الطول." if limited
+                else "تعذر إكمال الإجابة من مزود الذكاء الاصطناعي."
+            ),
+            "citations": citation_list,
+            "usage": usage,
+        }) + "\n\n"
+        return
 
     if url_citations:
         links = []

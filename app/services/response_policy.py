@@ -6,7 +6,9 @@ import re
 from dataclasses import dataclass
 from typing import Sequence
 
+from .grounding import is_bank_details_query
 from .verified_answers import request_clauses
+from .query_router import QueryIntent, classify_query
 
 
 @dataclass(frozen=True)
@@ -14,6 +16,7 @@ class ResponsePolicy:
     kind: str
     max_output_tokens: int
     instruction: str
+    teaching: bool = False
 
 
 _DETAIL = re.compile(r"بالتفصيل|شرح (?:شامل|مفصل)|خطوة بخطوة|detailed|in depth|in detail|comprehensive|step.by.step")
@@ -44,6 +47,10 @@ _MULTIPLE = re.compile(
     r"(?:\s|[،,])و\s*(?:متى|وين|كم|هل|ليش|اشرح|وضح|اعطني|عطني|اديني|كيف|شلون|ما هي|شنو)\b|"
     r"\band (?:when|where|whether|explain|show|give|calculate|how|what|why)\b"
 )
+_POLICY_LIST = re.compile(
+    r"(?:قواعد|ضوابط|شروط|متطلبات|استثناءات|عقوبات|rules|conditions|requirements|exceptions|penalties)"
+    r"(?:\s|$)"
+)
 _LINK_ONLY = re.compile(
     r"^(?:(?:ابي|ارسل|اعطني|عطني|اريد|وين|اين|ممكن) (?:لي )?)?(?:رابط|لينك|لنك)\b|"
     r"^(?:send|give|show) me (?:the )?(?:official )?link\b"
@@ -68,11 +75,15 @@ def response_policy_for(message: str, *, previous_answer: bool = False) -> Respo
     follow_up = bool(_FOLLOW_UP.search(text))
     mixed = len(request_clauses(message)) > 1 or bool(_MULTIPLE.search(text)) or text.count("؟") + text.count("?") > 1
 
+    official = classify_query(message) in {
+        QueryIntent.OFFICIAL_UNIVERSITY, QueryIntent.TIME_SENSITIVE_UNIVERSITY,
+    }
     if mixed:
-        emphasis = " فصّل الجزء الذي يطلب شرحاً أو مثالاً." if requested_detail or _EDUCATIONAL.search(text) else ""
+        teaching = requested_detail or bool(_EDUCATIONAL.search(text))
+        emphasis = " فصّل الجزء الذي يطلب شرحاً أو مثالاً." if teaching else ""
         return ResponsePolicy("mixed", 2400,
             "أجب عن كل جزء بترتيب الطلب. اختصر الجزء المباشر، وأكمل أي جزء تعليمي أو تحليلي، "
-            "ولا تكرر ما عرضته الخدمة ضمن المعلومة المتحققة." + emphasis)
+            "ولا تكرر ما عرضته الخدمة ضمن المعلومة المتحققة." + emphasis, teaching=teaching)
     if follow_up and previous_answer:
         return ResponsePolicy("follow_up", 1800,
             "تابع آخر إجابة مرتبطة بالسؤال ووسّع النقطة المطلوبة بشرح إضافي أو مثال مناسب. "
@@ -99,7 +110,11 @@ def response_policy_for(message: str, *, previous_answer: bool = False) -> Respo
         return ResponsePolicy("procedure", 1050,
             "اذكر أقرب خطوة عملية أولاً. إذا احتاج الإجراء تسلسلاً، اذكر الخطوات اللازمة فقط بترتيبها، "
             "وغالباً تكفي 3 إلى 5 خطوات قصيرة. لا تسرد خطوات غير مؤكدة، وأبقِ شروط التنفيذ والاستثناءات.")
-    if _OFFICIAL.search(text):
+    if official and _POLICY_LIST.search(text):
+        return ResponsePolicy("policy_rules", 1150,
+            "ابدأ بالحكم أو الشروط المطلوبة مباشرة. اذكر البنود المؤثرة والاستثناءات مع نطاقها ومصدرها. "
+            "ميّز ما تؤكده الأدلة من النقاط التي لم تجد لها توثيقاً.")
+    if official or _OFFICIAL.search(text):
         return ResponsePolicy("academic", 850,
             "أعطِ الموعد أو الحكم في أول جملة، ثم نطاقه الفعلي والاستثناء المؤثر فقط. "
             "استهدف جملة أو جملتين مع رابط المصدر الرسمي. عند نقص بيانات تؤثر على الحكم، حدّد الناقص أو اذكر خطوة رسمية مفيدة؛ لا تحسب نتيجة على افتراضات غير معطاة.")
@@ -115,6 +130,10 @@ def response_policy_for(message: str, *, previous_answer: bool = False) -> Respo
 def response_policy_prompt(message: str, *, previous_answer: bool = False) -> str:
     policy = response_policy_for(message, previous_answer=previous_answer)
     brevity = " طلب الطالب الاختصار؛ قلّل الصياغة مع إبقاء المطلوب كاملاً." if _BRIEF.search(_normalized(message)) else ""
+    bank_source = (
+        " لا تعرض خياراً أو خطوات لتعديل البيانات البنكية في SIS دون توثيق رسمي مباشر."
+        if is_bank_details_query(message) else ""
+    )
     return (
         "# شكل الإجابة لهذا الطلب\n"
         f"- النوع: {policy.kind}\n"
@@ -127,4 +146,5 @@ def response_policy_prompt(message: str, *, previous_answer: bool = False) -> st
         "- عند تعذر التحقق، اذكر السبب في جملة وأضف أقرب خطوة موثوقة إذا كانت متاحة. "
         "لا تعوّض نقص الدليل بتفاصيل تخمينية أو تفترض شاشات وإعدادات أو رموزاً محلية. "
         "إذا حددت معلومة ناقصة، لا تعِد طلبها بصياغة ثانية؛ اسأل فقط إذا كانت تغيّر الجواب."
+        + bank_source
     )

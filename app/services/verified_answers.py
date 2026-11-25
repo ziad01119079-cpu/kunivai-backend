@@ -6,6 +6,8 @@ import re
 
 STUDENT_GUIDE = "https://www.ku.edu.kw/ar/new-student-journey"
 STUDENT_PORTAL = "https://portal.ku.edu.kw/sis"
+HOME_TRANSPORT = "https://gsd.ku.edu.kw/ar/services/home-transportation"
+CAMPUS_TRANSPORT = "https://gsd.ku.edu.kw/ar/departments/transportation-section"
 STANDING_FAQ = "https://www.ku.edu.kw/sites/default/files/2025-08/FAQAr.pdf"
 COURSE_RULES = "https://shi.ku.edu.kw/ar/courses-system-list"
 GEMINI_WORKSHOP = "https://afaq.ku.edu.kw/ar/media-center/news/n3-61"
@@ -84,6 +86,24 @@ def known_answer(question: str, prior_messages_desc: list[dict]) -> VerifiedAnsw
         return _with_source("", "Official new student guide" if english else "دليل الطالب الجديد على موقع جامعة الكويت", STUDENT_GUIDE)
     if matches(rf"{link_request} (?:نظام )?(?:تسجيل|تسجل) المقررات|(?:send me|give me) (?:the )?course registration link"):
         return _with_source("", "Kuwait University course registration" if english else "نظام تسجيل المقررات في جامعة الكويت", STUDENT_PORTAL)
+    if matches(
+        rf"(?:(?:شلون|كيف|ابي|اريد) (?:اعدل|اغير|احدث|تعديل|تغيير|تحديث)|(?:(?:اين|وين) )?{link_request} (?:تعديل|تحديث|تغيير)) "
+        r"(?:بياناتي البنكي[هة]|(?:ال)?(?:بيانات|معلومات|معلوماتي) البنكي[هة]|بيانات(?:ي)? (?:البنك|الحساب البنكي)|رقم (?:حسابي البنكي|الايبان|ايبان|iban)|الايبان|iban)(?: للطالب)?"
+        r"(?: (?:في|على|من) (?:نظام )?(?:الطالب|تسجيل المقررات|sis|البوابه))?"
+    ):
+        return _with_source(
+            "ما قدرت أتحقق من رابط مباشر أو خيار داخل SIS لتعديل البيانات البنكية. اسأل شؤون الطلبة عن قناة التحديث المعتمدة. هذه البوابة للدخول العام.",
+            "بوابة نظام معلومات الطالب", STUDENT_PORTAL,
+        )
+    if matches(
+        r"(?:(?:كيف|شلون) (?:اسجل|التسجيل)(?: في)?|(?:ابي|اريد) (?:رابط |التسجيل في)?|رابط) "
+        r"(?:الباص الجامعي|النقل الجامعي|النقل المنزلي|باص الجامعة|باصات الجامعة)(?: للطالبات)?"
+    ):
+        return VerifiedAnswer(
+            f"[النقل المنزلي للطالبات]({HOME_TRANSPORT}): التقديم عبر نظام معلومات الطالب. "
+            f"للتنقل بين الكليات داخل الجامعة، راجع [قسم النقليات]({CAMPUS_TRANSPORT}) لمواعيد الحافلات وطريقة استخدامها.",
+            (("النقل المنزلي للطالبات", HOME_TRANSPORT), ("قسم النقليات", CAMPUS_TRANSPORT)),
+        )
     if matches(rf"(?:(?:السلام عليكم|سلام عليكم) )?{link_request} جامعة الكويت"):
         return _with_source("", "موقع جامعة الكويت الرسمي", "https://www.ku.edu.kw/")
     if matches(

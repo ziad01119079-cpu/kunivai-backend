@@ -10,11 +10,17 @@ from ..history_builder import _estimate_tokens
 logger = logging.getLogger(__name__)
 # Standard USD per million text tokens. Unknown models and missing usage stay unknown.
 PRICE_VERSION = "2026-11-25-standard"
-RATES = {"gpt-4o": (2.50, 1.25, 10.00), "gpt-4o-mini": (0.15, 0.075, 0.60)}
+RATES = {
+    "gpt-4o": (2.50, 1.25, 10.00),
+    "gpt-4o-mini": (0.15, 0.075, 0.60),
+    "gpt-6-luna": (0.10, 0.01, 0.50),
+    "gpt-5.4-mini": (0.75, 0.075, 4.50),
+}
 SNAPSHOTS = {
     "gpt-4o-2024-08-06": "gpt-4o",
     "gpt-4o-2024-11-20": "gpt-4o",
     "gpt-4o-mini-2024-07-18": "gpt-4o-mini",
+    "gpt-5.4-mini-2026-03-17": "gpt-5.4-mini",
 }
 
 
@@ -33,15 +39,19 @@ def token_fields(usage, *, responses: bool) -> dict:
         "input_tokens": count(getattr(usage, prompt_field, None)),
         "output_tokens": count(getattr(usage, output_field, None)),
         "cached_tokens": count(getattr(details, "cached_tokens", None)),
+        "reasoning_tokens": count(getattr(getattr(usage, output_field + "_details", None), "reasoning_tokens", None)),
     }
 
 
 def estimate_cost(model: str | None, tokens: dict, file_search: int | None, web_search: int | None,
                   *, preview: bool = False) -> float | None:
-    rate = RATES.get(SNAPSHOTS.get(model, model))
+    family = SNAPSHOTS.get(model, model)
+    rate = RATES.get(family)
     incoming, outgoing, cached = (tokens[k] for k in ("input_tokens", "output_tokens", "cached_tokens"))
     if rate is None or incoming is None or outgoing is None or file_search is None or web_search is None:
         return None
+    if family == "gpt-6-luna" and incoming > 272_000:
+        rate = (rate[0] * 2, rate[1] * 2, rate[2] * 1.5)
     cached = min(cached or 0, incoming)
     text = ((incoming - cached) * rate[0] + cached * rate[1] + outgoing * rate[2]) / 1_000_000
     return round(text + file_search * 0.0025 + web_search * (0.025 if preview else 0.01), 9)
@@ -80,10 +90,10 @@ class UsageTrace:
 
     def summary(self, phase: str, **timing) -> None:
         estimates = [attempt["estimated_cost_usd"] for attempt in self.attempts]
-        known_tokens = {key: 0 for key in ("input_tokens", "output_tokens", "cached_tokens")}
+        known_tokens = {key: 0 for key in ("input_tokens", "output_tokens", "cached_tokens", "reasoning_tokens")}
         for attempt in self.attempts:
             for key in known_tokens:
-                known_tokens[key] += attempt[key] or 0
+                known_tokens[key] += attempt.get(key) or 0
         log_usage("provider_request_usage", {
             "trace_id": self.trace_id, "phase": phase, "route": self.route,
             "attempts": len(estimates), "unpriced_attempts": estimates.count(None),

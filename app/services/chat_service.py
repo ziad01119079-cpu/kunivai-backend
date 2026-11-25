@@ -15,11 +15,13 @@ from .query_router import (
     QueryIntent,
     contextual_query_intent,
     is_general_academic_explanation,
+    is_explicit_policy_request,
     ku_web_search_tool,
     should_fallback_to_web,
 )
 from .missed_query_service import analyze_and_log_missed_query
 from .academic_calendar import (
+    LAW_GUIDANCE_URL,
     calendar_prompt_context,
     format_calendar_answer,
     is_english_message,
@@ -40,7 +42,8 @@ from .schedule_context import build_schedule_context
 from .grounding import applicable_citations, missing_evidence_answer, needs_authoritative_policy, sanitize_university_id_answer
 from .provider_usage import UsageTrace, current_usage
 from .verified_answers import arithmetic_match, known_answer, request_clauses
-from .response_policy import has_previous_answer, response_policy_prompt
+from .response_policy import has_previous_answer, response_policy_for, response_policy_prompt
+from .model_policy import model_options
 from ..task_tracker import background_tasks
 from ..logger import chat_id_var, generation_fence_var, uid_var
 
@@ -174,7 +177,12 @@ async def process_chat(
         else:
             remaining.append(clause)
     remaining_question = " ".join(remaining) if is_mixed else message
+    remaining_intents = {contextual_query_intent(clause, raw_messages) for clause in remaining} if is_mixed else set()
     intent = contextual_query_intent(remaining_question, raw_messages)
+    for official_intent in (QueryIntent.TIME_SENSITIVE_UNIVERSITY, QueryIntent.OFFICIAL_UNIVERSITY):
+        if official_intent in remaining_intents:
+            intent = official_intent
+            break
     needs_generation = is_mixed and bool(remaining)
 
     # A standalone lesson without attached context can omit schedules. Once
@@ -190,7 +198,15 @@ async def process_chat(
     ):
         schedule_context = None
     calendar_resolution = None
-    length_context = response_policy_prompt(message, previous_answer=has_previous_answer(history_dicts[:-1]))
+    previous_answer = has_previous_answer(history_dicts[:-1])
+    length_context = response_policy_prompt(message, previous_answer=previous_answer)
+    shape = response_policy_for(message, previous_answer=previous_answer)
+
+    def stream_chat(messages, prompt, *, tools, fallback=False):
+        return stream_response(
+            messages, prompt, tools=tools,
+            **model_options(config, shape, rag=bool(tools), fallback=fallback),
+        )
     academic_calendar_context = (
         calendar_prompt_context(calendar_query, calendar_resolution)
         if calendar_query
@@ -211,7 +227,7 @@ async def process_chat(
     require_official = (
         intent is not QueryIntent.PERSONAL_SCHEDULE
         and not is_general_academic_explanation(remaining_question)
-        and needs_authoritative_policy(remaining_question)
+        and (needs_authoritative_policy(remaining_question) or is_explicit_policy_request(remaining_question))
     )
     use_web_search = intent is QueryIntent.TIME_SENSITIVE_UNIVERSITY
     use_file_search = (require_official and not use_web_search) or intent in {
@@ -244,6 +260,17 @@ async def process_chat(
         except json.JSONDecodeError as exc:
             logger.warning("Failed to decode SSE line: %s", exc)
             return None
+
+    def stream_error(error: dict | None = None) -> str:
+        # Usage and annotations from unfinished text are internal metadata.
+        payload = (
+            {key: value for key, value in error.items() if key not in {"usage", "citations", "evidence"}}
+            if error else {
+                "type": "error", "code": "LLM_STREAM_INTERRUPTED", "retryable": True,
+                "message": "انقطع بث مزود الذكاء الاصطناعي قبل اكتماله.",
+            }
+        )
+        return "data: " + json.dumps(payload) + "\n\n"
 
     def public_done(payload: dict) -> str:
         public_payload = {key: value for key, value in payload.items() if key != "evidence"}
@@ -355,9 +382,18 @@ async def process_chat(
             local_texts.append(result.text)
             local_citations.extend(result.citations())
         if calendar_query is not None:
-            local_texts.append(format_calendar_answer(
+            calendar_answer = format_calendar_answer(
                 calendar_query, calendar_resolution, english=is_english_message(message)
-            ))
+            )
+            local_texts.append(calendar_answer)
+            if f"]({LAW_GUIDANCE_URL})" in calendar_answer:
+                local_citations.append({
+                    "type": "url_citation",
+                    "url": LAW_GUIDANCE_URL,
+                    "title": "Academic Guidance" if is_english_message(message) else "الإرشاد والتوجيه بكلية الحقوق",
+                    "start_index": 0,
+                    "end_index": 0,
+                })
             local_citations.extend({
                 "type": "url_citation",
                 "url": source.url,
@@ -393,7 +429,7 @@ async def process_chat(
             web_citations: list[dict] = []
             web_evidence: list[str] = []
             web_error: dict | None = None
-            async for sse_line in stream_response(
+            async for sse_line in stream_chat(
                 history_dicts,
                 get_web_search_prompt(
                     system_context,
@@ -414,9 +450,9 @@ async def process_chat(
                         done_payload = payload
                     elif payload.get("type") == "error":
                         web_error = payload
-            if web_error is not None:
+            if web_error is not None or done_payload is None:
                 provider_failed = True
-                yield "data: " + json.dumps(web_error) + "\n\n"
+                yield stream_error(web_error)
                 return
             answer, web_citations = verify_retrieval("".join(web_text).strip(), web_citations, web_evidence)
             accumulated_text.append(answer)
@@ -432,7 +468,7 @@ async def process_chat(
             retrieved_evidence: list[str] = []
             retrieved_done: dict | None = None
 
-            async for sse_line in stream_response(
+            async for sse_line in stream_chat(
                 history_dicts, system_prompt, tools=tools
             ):
                 payload = parse_sse(sse_line)
@@ -442,7 +478,7 @@ async def process_chat(
                     continue
                 if payload.get("type") == "error":
                     provider_failed = True
-                    yield sse_line
+                    yield stream_error(payload)
                     return
                 if payload.get("type") == "chunk":
                     retrieved_text.append(payload.get("content", ""))
@@ -450,6 +486,11 @@ async def process_chat(
                     retrieved_citations.extend(payload.get("citations", []))
                     retrieved_evidence.extend(payload.get("evidence", []))
                     retrieved_done = payload
+
+            if retrieved_done is None:
+                provider_failed = True
+                yield stream_error()
+                return
 
             retrieved_answer = "".join(retrieved_text).strip()
             usable_retrieved_citations = applicable_citations(retrieved_citations, require_official=require_official)
@@ -466,10 +507,7 @@ async def process_chat(
                     retrieved_evidence,
                 )
                 add_provider_citations(retrieved_citations)
-                done_payload = retrieved_done or {
-                    "type": "done",
-                    "citations": retrieved_citations,
-                }
+                done_payload = retrieved_done
                 if was_sanitized:
                     accumulated_text.append(safe_answer)
                     yield "data: " + json.dumps(
@@ -495,7 +533,7 @@ async def process_chat(
                 web_evidence: list[str] = []
                 web_citations: list[dict] = []
                 web_error: dict | None = None
-                async for sse_line in stream_response(
+                async for sse_line in stream_chat(
                     history_dicts,
                     get_web_search_prompt(
                         system_context,
@@ -503,6 +541,7 @@ async def process_chat(
                         academic_calendar_context,
                     ),
                     tools=[ku_web_search_tool()],
+                    fallback=True,
                 ):
                     if ttft is None and '"type": "chunk"' in sse_line:
                         ttft = time.perf_counter() - openai_start
@@ -516,9 +555,9 @@ async def process_chat(
                             done_payload = payload
                         elif payload.get("type") == "error":
                             web_error = payload
-                if web_error is not None:
+                if web_error is not None or done_payload is None:
                     provider_failed = True
-                    yield "data: " + json.dumps(web_error) + "\n\n"
+                    yield stream_error(web_error)
                     return
                 safe_answer, web_citations = verify_retrieval("".join(web_text).strip(), web_citations, web_evidence)
                 accumulated_text.append(safe_answer)
@@ -527,7 +566,7 @@ async def process_chat(
                     {"type": "chunk", "content": safe_answer}
                 ) + "\n\n"
         else:
-            async for sse_line in stream_response(
+            async for sse_line in stream_chat(
                 history_dicts, system_prompt, tools=[]
             ):
                 if ttft is None and '"type": "chunk"' in sse_line:
@@ -536,7 +575,7 @@ async def process_chat(
                 if payload is not None:
                     if payload.get("type") == "error":
                         provider_failed = True
-                        yield sse_line
+                        yield stream_error(payload)
                         return
                     if payload.get("type") == "chunk":
                         accumulated_text.append(payload.get("content", ""))
@@ -546,6 +585,11 @@ async def process_chat(
                     done_payload = payload
                 else:
                     yield sse_line
+
+        if done_payload is None:
+            provider_failed = True
+            yield stream_error()
+            return
 
         # `done` means both messages have been committed in order (or that a
         # persistence failure was logged).  This makes immediate follow-ups see
@@ -561,12 +605,12 @@ async def process_chat(
                 unique_citations.append(citation)
             accumulated_citations[:] = unique_citations
         persisted = await persist_assistant_message()
-        if done_payload is not None and generation_claim is not None and not persisted:
+        if generation_claim is not None and not persisted:
             yield 'data: ' + json.dumps({
                 "type": "error", "code": "AI_PERSISTENCE_UNCONFIRMED", "retryable": False,
                 "message": "تعذر تأكيد حفظ الإجابة. تحقق من سجل المحادثة.",
             }) + '\n\n'
-        elif done_payload is not None:
+        else:
             yield public_done(done_payload)
 
     except asyncio.CancelledError:

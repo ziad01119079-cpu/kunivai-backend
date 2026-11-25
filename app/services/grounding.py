@@ -183,12 +183,19 @@ def applicable_citations(citations: list[dict], *, require_official: bool) -> li
     return accepted
 
 
+def is_bank_details_query(question: str) -> bool:
+    return bool(re.search(
+        r"(?:بيانات|معلومات)(?:ي)? (?:البنكي[هة]|بنكي[هة]|البنك|الحساب البنكي)|الايبان|\b(?:bank details|iban)\b",
+        _normalize(question),
+    ))
+
+
 def needs_authoritative_policy(question: str) -> bool:
     normalized = _normalize(question)
-    return bool(re.search(
-        r"حساب الطالب|نظام (?:الطالب|التسجيل)|البيانات البنكية|معلومات بنكية|الايبان|كلمة (?:السر|المرور)|"
+    return is_bank_details_query(question) or bool(re.search(
+        r"حساب الطالب|نظام (?:الطالب|التسجيل)|كلمة (?:السر|المرور)|"
         r"الانذار الاكاديمي|الايقاف الاكاديمي|(?:شروط|قواعد).{0,20}التحويل|"
-        r"student (?:account|portal)|academic (?:standing|warning|probation)|bank details|"
+        r"student (?:account|portal)|academic (?:standing|warning|probation)|"
         r"(?:اضيف|احذف|اسجل) مقرر|how (?:do|can) i (?:add|drop) a course",
         normalized,
     ))

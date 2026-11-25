@@ -40,6 +40,19 @@ class Config:
             self.OPENAI_API_KEY = _require("OPENAI_API_KEY")
             self.OPENAI_VECTOR_STORE_ID = _require("OPENAI_VECTOR_STORE_ID")
         self.OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.OPENAI_ROUTE_MODELS_ENABLED = os.getenv(
+            "OPENAI_ROUTE_MODELS_ENABLED", "false"
+        ).strip().lower() in {"true", "1", "yes"}
+        self.OPENAI_MODEL_DEFAULT = os.getenv("OPENAI_MODEL_DEFAULT", "").strip()
+        self.OPENAI_MODEL_RAG = os.getenv("OPENAI_MODEL_RAG", "").strip()
+        self.OPENAI_MODEL_RAG_FALLBACK = os.getenv("OPENAI_MODEL_RAG_FALLBACK", "").strip()
+        self.OPENAI_MODEL_DETAILED = os.getenv("OPENAI_MODEL_DETAILED", "").strip()
+        self.OPENAI_REASONING_EFFORT_DEFAULT = os.getenv("OPENAI_REASONING_EFFORT_DEFAULT", "none").strip()
+        self.OPENAI_REASONING_EFFORT_DETAILED = os.getenv("OPENAI_REASONING_EFFORT_DETAILED", "low").strip()
+        if self.OPENAI_ROUTE_MODELS_ENABLED and {
+            self.OPENAI_REASONING_EFFORT_DEFAULT, self.OPENAI_REASONING_EFFORT_DETAILED
+        } - {"none", "low"}:
+            raise ValueError("Chat reasoning effort must be none or low")
         self.OPENAI_SCHEDULE_MODEL = os.getenv(
             "OPENAI_SCHEDULE_MODEL", self.OPENAI_MODEL
         )

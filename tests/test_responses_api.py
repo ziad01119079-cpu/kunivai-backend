@@ -327,3 +327,54 @@ def test_retrieval_ceiling_and_followup_depth_are_not_clipped_by_short_default()
 
     assert calls[0]["max_output_tokens"] >= 850
     assert calls[1]["max_output_tokens"] > calls[0]["max_output_tokens"]
+
+
+@pytest.mark.parametrize("reason,code", [
+    ("max_output_tokens", "OUTPUT_LIMIT_REACHED"),
+    ("content_filter", "LLM_RESPONSE_INCOMPLETE"),
+    ("unknown", "LLM_RESPONSE_INCOMPLETE"),
+])
+def test_incomplete_retrieval_keeps_metadata_without_resolving_files(reason, code):
+    raw = "نص\ue200filecite\ue202turn0file10\ue201 ودليل"
+    file = SimpleNamespace(type="file_citation", file_id="file-1", filename="policy.pdf", index=raw.index(" ودليل"))
+    usage = SimpleNamespace(
+        input_tokens=600, output_tokens=140, total_tokens=740,
+        input_tokens_details=SimpleNamespace(cached_tokens=30),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=45),
+    )
+    output = SimpleNamespace(type="message", content=[
+        SimpleNamespace(type="output_text", text=raw, annotations=[file])
+    ])
+    response = SimpleNamespace(usage=usage, output=[output], incomplete_details=SimpleNamespace(reason=reason))
+    events = [SimpleNamespace(type="response.output_text.delta", delta=piece) for piece in
+              ["نص\ue200file", "cite\ue202turn", "0file10\ue201 و", "دليل"]]
+    events.append(SimpleNamespace(type="response.incomplete", response=response))
+    calls = []
+
+    def capture(**kwargs):
+        calls.append(kwargs)
+        return _FakeStream(events)
+
+    async def run():
+        return [json.loads(line[6:]) async for line in stream_response(
+            [{"role": "user", "content": "ما هي قواعد تأجيل الامتحان؟"}], "prompt",
+            tools=[{"type": "file_search", "vector_store_ids": ["fixture"]}],
+            model="gpt-6-luna", reasoning_effort="low",
+        )]
+
+    with (
+        patch("app.responses_api.get_openai_client", return_value=SimpleNamespace(responses=SimpleNamespace(stream=capture))),
+        patch("app.responses_api.get_config", return_value=SimpleNamespace(OPENAI_MODEL="gpt-4o")),
+        patch("app.responses_api._resolve_citations", side_effect=AssertionError("incomplete")),
+    ):
+        payloads = asyncio.run(run())
+
+    assert len(calls) == 1 and calls[0]["reasoning"] == {"effort": "low"}
+    assert calls[0]["model"] == "gpt-6-luna"
+    assert calls[0]["max_output_tokens"] > 1150
+    assert "".join(row["content"] for row in payloads[:-1]) == "نص ودليل"
+    assert payloads[-1]["type"] == "error" and payloads[-1]["code"] == code
+    assert payloads[-1]["reason"] == reason and payloads[-1]["retryable"] is False
+    assert payloads[-1]["citations"][0]["index"] == len("نص")
+    assert payloads[-1]["usage"]["cached_tokens"] == 30
+    assert payloads[-1]["usage"]["reasoning_tokens"] == 45
