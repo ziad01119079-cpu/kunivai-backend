@@ -1,0 +1,485 @@
+[
+  {
+    "id": "Q001",
+    "question": "متى فاينل أول سنة في كلية الحقوق؟",
+    "expected": "Refuse to substitute vacation or university-wide date; offer Law guidance",
+    "evidence": [
+      {
+        "url": "https://do.ku.edu.kw/ar/lawcalender",
+        "note": "فصل خريف 2026/2027 في كلية الحقوق: 10–30 يناير 2027 إجازة للطلبة. لا يوجد تاريخ مثبت لفاينل السنة الأولى في هذه الصفحة."
+      },
+      {
+        "url": "https://law.ku.edu.kw/ar/students/guidance-and-counseling",
+        "note": "Official faculty guidance contact"
+      }
+    ],
+    "history": [],
+    "historical_words": 166
+  },
+  {
+    "id": "Q002",
+    "question": "أقصد أول سنة بكلية الحقوق.",
+    "expected": "Carry prior finals intent, do not invent dates, Law guidance",
+    "evidence": [
+      {
+        "url": "https://do.ku.edu.kw/ar/lawcalender",
+        "note": "فصل خريف 2026/2027 في كلية الحقوق: 10–30 يناير 2027 إجازة للطلبة. لا يوجد تاريخ مثبت لفاينل السنة الأولى في هذه الصفحة."
+      },
+      {
+        "url": "https://law.ku.edu.kw/ar/students/guidance-and-counseling",
+        "note": "Official faculty guidance contact"
+      }
+    ],
+    "history": [
+      {
+        "role": "user",
+        "content": "متى الاختبارات النهائية؟"
+      },
+      {
+        "role": "assistant",
+        "content": "أي كلية تقصد؟"
+      }
+    ],
+    "historical_words": 121
+  },
+  {
+    "id": "Q003",
+    "question": "متى الاختبارات النهائية في التقويم العام للفصل الأول 2026/2027؟",
+    "expected": "Dec 23, 2026–Jan 4, 2027; general calendar only",
+    "evidence": [
+      {
+        "url": "https://do.ku.edu.kw/ar/academic-calendar-0",
+        "note": "فترة الامتحانات النهائية للفصل الأول 2026/2027 في التقويم العام 23/12/2026–4/1/2027."
+      }
+    ],
+    "history": [],
+    "historical_words": 117
+  },
+  {
+    "id": "Q004",
+    "question": "ما أبرز مصطلحات الجامعة ورموزها؟",
+    "expected": "Brief definitions; no invented codes; ask for a specific symbol if needed",
+    "evidence": [
+      {
+        "url": "https://shi.ku.edu.kw/ar/courses-system-list",
+        "note": "الوحدة الدراسية أساس حساب العبء الدراسي. العبء المعتاد 15–19 وحدة وفق المادة الرابعة، وتوجد استثناءات وموافقات. لا يحتوي المقتطف على معجم لكل الرموز."
+      }
+    ],
+    "history": [],
+    "historical_words": 562
+  },
+  {
+    "id": "Q005",
+    "question": "لو درجاتي المتوقعة A وB- وC وD، هل يروح الإنذار؟",
+    "expected": "Missing GPA/credits and warning type; mention simulator; no unsupported decision",
+    "evidence": [
+      {
+        "url": "https://www.ku.edu.kw/sites/default/files/2025-08/FAQAr.pdf",
+        "note": "يتطلب حساب أثر الدرجات على الإنذار معرفة نوعه والمعدل والوحدات؛ يقدم نظام معلومات الطالب أداة توقع المعدلات."
+      }
+    ],
+    "history": [],
+    "historical_words": 352
+  },
+  {
+    "id": "Q006",
+    "question": "أبي رابط صحيفة تخرج اللغة العربية في الآداب.",
+    "expected": "Clickable Arts Arabic cohort 2025/26 sheet; acknowledge unspecified cohort",
+    "evidence": [
+      {
+        "url": "https://arts.ku.edu.kw/sites/default/files/2026-09/StudnetGuide25-26.pdf",
+        "note": "صحيفة تخرج قسم اللغة العربية وآدابها للطلبة المستجدين في 2025/2026."
+      }
+    ],
+    "history": [],
+    "historical_words": 324
+  },
+  {
+    "id": "Q007",
+    "question": "وضح لي الوحدة الدراسية والعبء وبعض الرموز.",
+    "expected": "Explain unit and workload; no fake symbols",
+    "evidence": [
+      {
+        "url": "https://shi.ku.edu.kw/ar/courses-system-list",
+        "note": "الوحدة الدراسية أساس حساب العبء الدراسي. العبء المعتاد 15–19 وحدة وفق المادة الرابعة، وتوجد استثناءات وموافقات. لا يحتوي المقتطف على معجم لكل الرموز."
+      }
+    ],
+    "history": [],
+    "historical_words": 500
+  },
+  {
+    "id": "Q008",
+    "question": "كم صلاحية الهوية الجامعية وكيف أجددها؟",
+    "expected": "Validity unverified; identify official ID office and guidance; no invented renewal timing",
+    "evidence": [
+      {
+        "url": "https://ssd.ku.edu.kw/ar/services/university-id-issuance",
+        "note": "قسم الهويات بإدارة الأمن والسلامة يصدر البطاقة. يحتاج المستجدون فحصاً طبياً قبل الإصدار. لا تذكر الصفحة مدة صلاحية موحدة أو موعداً ثابتاً للتجديد."
+      }
+    ],
+    "history": [],
+    "historical_words": 382
+  },
+  {
+    "id": "Q009",
+    "question": "كم مكافأة تخصص علوم البحار؟",
+    "expected": "No authoritative amount in fixture; do not invent",
+    "evidence": [],
+    "history": [],
+    "historical_words": 213
+  },
+  {
+    "id": "Q010",
+    "question": "أبي قائمة التخصصات التي تستحق مكافأة التخصص النادر.",
+    "expected": "No official dated list; do not invent",
+    "evidence": [],
+    "history": [],
+    "historical_words": 338
+  },
+  {
+    "id": "Q011",
+    "question": "متى تسكر مكتبة الشريعة شمالي؟",
+    "expected": "Do not substitute another campus or an unsupported time",
+    "evidence": [],
+    "history": [],
+    "historical_words": 241
+  },
+  {
+    "id": "Q012",
+    "question": "شلون أسجل في الباص من البيت للجامعة؟",
+    "expected": "At-home bus is for women; appropriate numbered steps and official link",
+    "evidence": [
+      {
+        "url": "https://gsd.ku.edu.kw/ar/services/home-transportation",
+        "note": "خدمة تسجيل النقل المنزلي تخص الطالبات: الدخول إلى نظام معلومات الطالب ثم الخدمات الأكاديمية والنماذج والطلبات واختيار وسائل النقل وإكمال العنوان والدفع وإثباته. النقل الداخلي خدمة منفصلة."
+      }
+    ],
+    "history": [],
+    "historical_words": 194
+  },
+  {
+    "id": "Q013",
+    "question": "نظام تسجيل المقررات ما يفتح معي، كيف أصلح المشكلة؟",
+    "expected": "Distinguish password vs outage; use official support path",
+    "evidence": [
+      {
+        "url": "https://www.ku.edu.kw/ar/new-student-journey",
+        "note": "رحلة الطالب الجديد تشمل إعادة تعيين كلمة المرور والدعم التقني. لا تثبت عطلا حاليا."
+      },
+      {
+        "url": "https://cis.ku.edu.kw/ar/contact-us",
+        "note": "مركز نظم المعلومات جهة الدعم الرسمية."
+      }
+    ],
+    "history": [],
+    "historical_words": 458
+  },
+  {
+    "id": "Q014",
+    "question": "عندي مشكلة في حساب الطالب.",
+    "expected": "One focused clarification; do not guess banking",
+    "evidence": [],
+    "history": [],
+    "historical_words": 404
+  },
+  {
+    "id": "Q015",
+    "question": "أين رابط تحديث المعلومات البنكية للطالب؟",
+    "expected": "No verified section or direct bank link; official SIS can be entry only",
+    "evidence": [
+      {
+        "url": "https://portal.ku.edu.kw/sis",
+        "note": "بوابة نظام معلومات الطالب؛ لا يوجد دليل مثبت على رابط تعديل بيانات البنك المباشر."
+      }
+    ],
+    "history": [],
+    "historical_words": 240
+  },
+  {
+    "id": "Q016",
+    "question": "هل خلصت صيانة بوابة الطالب؟",
+    "expected": "No verified live status; point to official support",
+    "evidence": [
+      {
+        "url": "https://cis.ku.edu.kw/ar/contact-us",
+        "note": "جهة الدعم الرسمية؛ لا يوجد في المقتطف إعلان انتهاء الصيانة."
+      }
+    ],
+    "history": [],
+    "historical_words": 316
+  },
+  {
+    "id": "Q019",
+    "question": "شنو أهم اختصارات الجامعة ورموزها؟",
+    "expected": "Avoid fabricated codes; give brief verified useful basics",
+    "evidence": [
+      {
+        "url": "https://shi.ku.edu.kw/ar/courses-system-list",
+        "note": "الوحدة الدراسية أساس حساب العبء الدراسي. العبء المعتاد 15–19 وحدة وفق المادة الرابعة، وتوجد استثناءات وموافقات. لا يحتوي المقتطف على معجم لكل الرموز."
+      }
+    ],
+    "history": [],
+    "historical_words": 330
+  },
+  {
+    "id": "Q020",
+    "question": "ارسل رابط الدعم التقني الرسمي لجامعة الكويت.",
+    "expected": "Official clickable contact link",
+    "evidence": [
+      {
+        "url": "https://cis.ku.edu.kw/ar/contact-us",
+        "note": "صفحة التواصل مع مركز نظم المعلومات."
+      }
+    ],
+    "history": [],
+    "historical_words": 242
+  },
+  {
+    "id": "Q023",
+    "question": "شلون أستخدم Gemini Enterprise في الجامعة؟",
+    "expected": "Separate educational suggestions from institution access; no invented provision",
+    "evidence": [
+      {
+        "url": "https://afaq.ku.edu.kw/ar/media-center/news/n3-61",
+        "note": "الجامعة وثقت ورشة Gemini Enterprise بمشاركة طلاب؛ هذا لا يثبت صلاحية دخول فردية أو خطوات تسجيل الدخول أو وجود رمز دخول."
+      }
+    ],
+    "history": [],
+    "historical_words": 512
+  },
+  {
+    "id": "Q024",
+    "question": "طيب عقب ما أغير كلمة السر شأسوي بخصوص Gemini؟",
+    "expected": "Carry prior context, missing verified access workflow; official help",
+    "evidence": [
+      {
+        "url": "https://afaq.ku.edu.kw/ar/media-center/news/n3-61",
+        "note": "الجامعة وثقت ورشة Gemini Enterprise بمشاركة طلاب؛ هذا لا يثبت صلاحية دخول فردية أو خطوات تسجيل الدخول أو وجود رمز دخول."
+      },
+      {
+        "url": "https://cis.ku.edu.kw/ar/contact-us",
+        "note": "Official IT contact"
+      }
+    ],
+    "history": [
+      {
+        "role": "user",
+        "content": "كيف أسجل دخول Gemini؟"
+      },
+      {
+        "role": "assistant",
+        "content": "ما عندي خطوات دخول مؤكدة."
+      }
+    ],
+    "historical_words": 325
+  },
+  {
+    "id": "Q026",
+    "question": "شنو يعني الأوفر لود والرموز في الجدول؟",
+    "expected": "Explain permitted higher credit load; ask which symbol",
+    "evidence": [
+      {
+        "url": "https://shi.ku.edu.kw/ar/courses-system-list",
+        "note": "الوحدة الدراسية أساس حساب العبء الدراسي. العبء المعتاد 15–19 وحدة وفق المادة الرابعة، وتوجد استثناءات وموافقات. لا يحتوي المقتطف على معجم لكل الرموز."
+      }
+    ],
+    "history": [],
+    "historical_words": 394
+  },
+  {
+    "id": "Q034",
+    "question": "شلون أشغل الوضع الداكن في التطبيق؟",
+    "expected": "Do not invent settings; concise uncertainty",
+    "evidence": [],
+    "history": [],
+    "historical_words": 122
+  },
+  {
+    "id": "Q037",
+    "question": "في منصات تفيدني بملخصات مذاكرة موثوقة؟",
+    "expected": "Short methods or suggestions; no invented endorsements",
+    "evidence": [],
+    "history": [],
+    "historical_words": 335
+  },
+  {
+    "id": "Q065",
+    "question": "شلون أتأكد من تقييم مدرس لمقرر؟",
+    "expected": "Suggest appropriate public/official channels; no unsupported reputation or scores",
+    "evidence": [],
+    "history": [],
+    "historical_words": 113
+  },
+  {
+    "id": "Q070",
+    "question": "شنو متطلبات وقف القيد للترم؟",
+    "expected": "Distinguish tracks and college office; no unsupported duration",
+    "evidence": [
+      {
+        "url": "https://www.ku.edu.kw/sites/default/files/2025-08/FAQAr.pdf",
+        "note": "وقف القيد أو الانسحاب يبدأ بطلب عن طريق مكتب التوجيه والإرشاد بالكلية. شروط الاختياري والإجباري مختلفة."
+      }
+    ],
+    "history": [],
+    "historical_words": 260
+  },
+  {
+    "id": "Q076",
+    "question": "كيف التسجيل في الباص الجامعي؟",
+    "expected": "Clarify or distinguish shuttle vs home transport; preserve audience and source",
+    "evidence": [
+      {
+        "url": "https://gsd.ku.edu.kw/ar/services/home-transportation",
+        "note": "خدمة تسجيل النقل المنزلي تخص الطالبات: الدخول إلى نظام معلومات الطالب ثم الخدمات الأكاديمية والنماذج والطلبات واختيار وسائل النقل وإكمال العنوان والدفع وإثباته. النقل الداخلي خدمة منفصلة."
+      },
+      {
+        "url": "https://gsd.ku.edu.kw/ar/departments/transportation-section",
+        "note": "قسم النقليات يميز النقل الداخلي والنقل المنزلي للطالبات."
+      }
+    ],
+    "history": [],
+    "historical_words": 200
+  },
+  {
+    "id": "Q094",
+    "question": "وين أقدم طلب نقل منزلي للطالبات؟",
+    "expected": "Official link and necessary steps only",
+    "evidence": [
+      {
+        "url": "https://gsd.ku.edu.kw/ar/services/home-transportation",
+        "note": "خدمة تسجيل النقل المنزلي تخص الطالبات: الدخول إلى نظام معلومات الطالب ثم الخدمات الأكاديمية والنماذج والطلبات واختيار وسائل النقل وإكمال العنوان والدفع وإثباته. النقل الداخلي خدمة منفصلة."
+      }
+    ],
+    "history": [],
+    "historical_words": 181
+  },
+  {
+    "id": "Q095",
+    "question": "متى لازم أجدد بطاقتي الجامعية؟",
+    "expected": "No invented deadline; official ID office",
+    "evidence": [
+      {
+        "url": "https://ssd.ku.edu.kw/ar/services/university-id-issuance",
+        "note": "قسم الهويات بإدارة الأمن والسلامة يصدر البطاقة. يحتاج المستجدون فحصاً طبياً قبل الإصدار. لا تذكر الصفحة مدة صلاحية موحدة أو موعداً ثابتاً للتجديد."
+      }
+    ],
+    "history": [],
+    "historical_words": 322
+  },
+  {
+    "id": "Q098",
+    "question": "عطني رابط تسجيل المقررات.",
+    "expected": "Official clickable SIS link",
+    "evidence": [
+      {
+        "url": "https://portal.ku.edu.kw/sis",
+        "note": "نظام معلومات الطالب لتسجيل المقررات؛ الرابط المطلوب للاستخدام."
+      }
+    ],
+    "history": [],
+    "historical_words": 94
+  },
+  {
+    "id": "N01",
+    "question": "كم دقيقة في ثلاث ساعات؟",
+    "expected": "180 minutes; brief",
+    "evidence": [],
+    "history": [],
+    "historical_words": null
+  },
+  {
+    "id": "N02",
+    "question": "ما هي أصغر دولة في العالم؟",
+    "expected": "Vatican City; concise",
+    "evidence": [],
+    "history": [],
+    "historical_words": null
+  },
+  {
+    "id": "N03",
+    "question": "اشرح قاعدة السلسلة في التفاضل مع مثال محلول.",
+    "expected": "Rule and worked composite derivative",
+    "evidence": [],
+    "history": [],
+    "historical_words": null
+  },
+  {
+    "id": "N04",
+    "question": "Explain in detail why dividing by a fraction means multiplying by its reciprocal. Work through two examples.",
+    "expected": "Derivation plus two correctly completed examples",
+    "evidence": [],
+    "history": [],
+    "historical_words": null
+  },
+  {
+    "id": "N05",
+    "question": "اشرح أكتر.",
+    "expected": "Expand why derivative is rate of change using a new example; no recap",
+    "evidence": [],
+    "history": [
+      {
+        "role": "user",
+        "content": "ما معنى المشتقة؟"
+      },
+      {
+        "role": "assistant",
+        "content": "المشتقة تقيس معدل تغير الدالة لحظيًا."
+      }
+    ],
+    "historical_words": null
+  },
+  {
+    "id": "N06",
+    "question": "Could you explain that further?",
+    "expected": "Explain previous mistake, show what happens to inequality sign with negative multiplier",
+    "evidence": [],
+    "history": [
+      {
+        "role": "user",
+        "content": "How do inequalities work?"
+      },
+      {
+        "role": "assistant",
+        "content": "Multiplying both sides by a negative number reverses the sign."
+      }
+    ],
+    "historical_words": null
+  },
+  {
+    "id": "N07",
+    "question": "متى آخر يوم سحب مواد في التقويم العام، واشرح الفرق مع الانسحاب الكلي.",
+    "expected": "24 October 2026 with scope/source + distinction",
+    "evidence": [
+      {
+        "url": "https://do.ku.edu.kw/ar/academic-calendar-0",
+        "note": "تقويم خريف 2026/27 العام: آخر يوم للانسحاب من المقررات 24 أكتوبر 2026. الانسحاب الكلي يخص الفصل كله، وتاريخه الظاهر غير متسق."
+      }
+    ],
+    "history": [],
+    "historical_words": null
+  },
+  {
+    "id": "N08",
+    "question": "علمني أحل 3x+4=19 خطوة بخطوة، وبعدين تحقق من الحل.",
+    "expected": "Solve x=5, show steps and substitution",
+    "evidence": [],
+    "history": [],
+    "historical_words": null
+  },
+  {
+    "id": "N09",
+    "question": "قارن Queue وStack مع مثال عملي لكل واحد.",
+    "expected": "FIFO vs LIFO and one example of each",
+    "evidence": [],
+    "history": [],
+    "historical_words": null
+  },
+  {
+    "id": "N10",
+    "question": "وضح بحساب مختصر كيف أطلّع معدل تخصصي: مقرر 3 وحدات بدرجة 4 ومقرر وحدتين بدرجة 3.",
+    "expected": "Use (12+6)/(3+2)=3.6, no extra calculations",
+    "evidence": [],
+    "history": [],
+    "historical_words": null
+  }
+]

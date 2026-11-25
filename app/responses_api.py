@@ -30,7 +30,7 @@ from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 from .config import get_config
 from .openai_client import get_openai_client
 from .services.coordination_runtime import distributed_enabled
-from .services.response_policy import response_policy_for
+from .services.response_policy import has_previous_answer, response_policy_for
 from .services.provider_usage import ProviderAttempt, input_breakdown
 
 logger = logging.getLogger(__name__)
@@ -136,11 +136,13 @@ async def _stream_response_once(
         *messages,
     ]
     if max_output_tokens is None:
-        latest_user_message = next(
-            (str(item.get("content", "")) for item in reversed(messages) if item.get("role") == "user"),
-            "",
-        )
-        max_output_tokens = response_policy_for(latest_user_message).max_output_tokens
+        latest = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), None)
+        question = str(messages[latest].get("content", "")) if latest is not None else ""
+        prior = messages[:latest] if latest is not None else []
+        policy = response_policy_for(question, previous_answer=has_previous_answer(prior))
+        # Retrieval and citations can need room even when the visible answer
+        # is short. These ceilings guard usage; the prompt sets the answer length.
+        max_output_tokens = max(policy.max_output_tokens, 850 if tools is None or tools else 0)
 
     full_text_parts: list[str] = []
     raw_citations: list[dict] = []   # file and URL citations
@@ -379,8 +381,9 @@ async def _stream_response_once(
 
     if url_citations:
         links = []
+        answer_text = "".join(full_text_parts)
         for citation in citation_list:
-            if citation.get("type") == "url_citation":
+            if citation.get("type") == "url_citation" and f"]({citation['url']})" not in answer_text:
                 title = citation.get("title") or citation["url"]
                 links.append(f"- [{title}]({citation['url']})")
         if links:

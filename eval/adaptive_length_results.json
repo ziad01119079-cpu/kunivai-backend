@@ -1,0 +1,243 @@
+{
+  "baseline_commit": "268c29bdce0685cd6793aaf0d6c06aed31498f2d",
+  "reported_snapshot": "gpt-4o-2024-08-06",
+  "paid_attempts": 156,
+  "estimated_total_usd": "0.79364500",
+  "approved_budget_usd": "3",
+  "estimates_from_provider_usage": true,
+  "live_production_retrieval_used": false,
+  "groups": {
+    "overall": {
+      "baseline": {
+        "n": 39,
+        "output_tokens": 4873,
+        "median_tokens": 58,
+        "words": 2495,
+        "complete": 31,
+        "useful": 31,
+        "verbose": 13,
+        "unsupported": 5,
+        "linked": 9,
+        "evidence_rows": 23,
+        "truncated": 1
+      },
+      "candidate": {
+        "n": 39,
+        "output_tokens": 4773,
+        "median_tokens": 82,
+        "words": 2345,
+        "complete": 31,
+        "useful": 30,
+        "verbose": 12,
+        "unsupported": 5,
+        "linked": 15,
+        "evidence_rows": 23,
+        "truncated": 0
+      }
+    },
+    "historical": {
+      "baseline": {
+        "n": 29,
+        "output_tokens": 2145,
+        "median_tokens": 51,
+        "words": 1131,
+        "complete": 23,
+        "useful": 22,
+        "verbose": 7,
+        "unsupported": 5,
+        "linked": 9,
+        "evidence_rows": 22,
+        "truncated": 0
+      },
+      "candidate": {
+        "n": 29,
+        "output_tokens": 2350,
+        "median_tokens": 65,
+        "words": 1173,
+        "complete": 21,
+        "useful": 20,
+        "verbose": 8,
+        "unsupported": 5,
+        "linked": 15,
+        "evidence_rows": 22,
+        "truncated": 0
+      }
+    },
+    "new": {
+      "baseline": {
+        "n": 10,
+        "output_tokens": 2728,
+        "median_tokens": 287.5,
+        "words": 1364,
+        "complete": 8,
+        "useful": 9,
+        "verbose": 6,
+        "unsupported": 0,
+        "linked": 0,
+        "evidence_rows": 1,
+        "truncated": 1
+      },
+      "candidate": {
+        "n": 10,
+        "output_tokens": 2423,
+        "median_tokens": 228.5,
+        "words": 1172,
+        "complete": 10,
+        "useful": 10,
+        "verbose": 4,
+        "unsupported": 0,
+        "linked": 0,
+        "evidence_rows": 1,
+        "truncated": 0
+      }
+    },
+    "short_facts_links": {
+      "baseline": {
+        "n": 4,
+        "output_tokens": 75,
+        "median_tokens": 18.0,
+        "words": 32,
+        "complete": 4,
+        "useful": 4,
+        "verbose": 0,
+        "unsupported": 0,
+        "linked": 2,
+        "evidence_rows": 2,
+        "truncated": 0
+      },
+      "candidate": {
+        "n": 4,
+        "output_tokens": 63,
+        "median_tokens": 17.0,
+        "words": 21,
+        "complete": 4,
+        "useful": 4,
+        "verbose": 0,
+        "unsupported": 0,
+        "linked": 2,
+        "evidence_rows": 2,
+        "truncated": 0
+      }
+    }
+  },
+  "score_basis": "One nonblinded reviewer, frozen anonymized test cases, iterative in-sample comparison.",
+  "failures": {
+    "incomplete": {
+      "baseline": [
+        "N05",
+        "N09",
+        "Q001",
+        "Q005",
+        "Q014",
+        "Q023",
+        "Q034",
+        "Q065"
+      ],
+      "candidate": [
+        "Q005",
+        "Q012",
+        "Q014",
+        "Q015",
+        "Q023",
+        "Q034",
+        "Q065",
+        "Q076"
+      ]
+    },
+    "not_useful": {
+      "baseline": [
+        "N09",
+        "Q004",
+        "Q007",
+        "Q014",
+        "Q019",
+        "Q023",
+        "Q034",
+        "Q065"
+      ],
+      "candidate": [
+        "Q004",
+        "Q007",
+        "Q014",
+        "Q015",
+        "Q019",
+        "Q023",
+        "Q034",
+        "Q065",
+        "Q076"
+      ]
+    },
+    "verbose": {
+      "baseline": [
+        "N03",
+        "N04",
+        "N05",
+        "N06",
+        "N07",
+        "N09",
+        "Q004",
+        "Q007",
+        "Q012",
+        "Q013",
+        "Q019",
+        "Q034",
+        "Q065"
+      ],
+      "candidate": [
+        "N04",
+        "N05",
+        "N09",
+        "N10",
+        "Q004",
+        "Q007",
+        "Q013",
+        "Q019",
+        "Q026",
+        "Q034",
+        "Q065",
+        "Q070"
+      ]
+    },
+    "unsupported": {
+      "baseline": [
+        "Q004",
+        "Q007",
+        "Q019",
+        "Q034",
+        "Q065"
+      ],
+      "candidate": [
+        "Q004",
+        "Q007",
+        "Q015",
+        "Q019",
+        "Q065"
+      ]
+    }
+  },
+  "case_notes": {
+    "Q001": "Candidate adds the Law guidance link without assigning vacation as finals.",
+    "Q002": "Both preserve Law first-year scope, but candidate drops the actionable clickable contact.",
+    "Q003": "Both date ranges are correct, with the general term and source stated.",
+    "Q004": "Codes presented as KU conventions exceed what the supplied evidence establishes.",
+    "Q005": "Both need the warning type and the credit-weight inputs to complete an individual answer.",
+    "Q007": "Both explain workload but add unsupported KU-specific schedule symbols.",
+    "Q012": "Baseline states eligibility; candidate uses feminine grammar but does not explicitly say who qualifies.",
+    "Q013": "Both provide help links and general troubleshooting, with more setup steps than the question needs.",
+    "Q014": "Neither asks the specific registration-versus-other-account question.",
+    "Q015": "Candidate suggests updating bank details through the SIS without evidence of that capability.",
+    "Q016": "Both link KU IT, which is a contact rather than proof of a current outage.",
+    "Q019": "Both add KU-specific code meanings beyond the supplied evidence.",
+    "Q023": "Both give a generic support direction and leave out documented tool context.",
+    "Q034": "Baseline guesses a KU app workflow; candidate lists generic screens without answering for the app.",
+    "Q065": "Both infer a course evaluation workflow without a verified source.",
+    "Q070": "Candidate adds the official FAQ, but repeats the direction to guidance.",
+    "Q076": "Baseline flags the home/internal distinction; candidate assumes the home service.",
+    "N04": "Both retain two complete worked examples.",
+    "N05": "Candidate adds a worked derivative expression. Its broad recap remains longer than the requested expansion needs.",
+    "N06": "Candidate explains the negative multiplier directly with a new numerical example.",
+    "N07": "Both explain both requested parts but omit the supplied calendar link.",
+    "N09": "Baseline reaches the output limit. Candidate completes both examples, then adds optional Python code.",
+    "N10": "Candidate preserves the weighted calculation and result while taking more text than the brief request needs."
+  }
+}

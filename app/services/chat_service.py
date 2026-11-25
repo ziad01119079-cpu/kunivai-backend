@@ -40,7 +40,7 @@ from .schedule_context import build_schedule_context
 from .grounding import applicable_citations, missing_evidence_answer, needs_authoritative_policy, sanitize_university_id_answer
 from .provider_usage import UsageTrace, current_usage
 from .verified_answers import arithmetic_match, known_answer, request_clauses
-from .response_policy import response_policy_prompt
+from .response_policy import has_previous_answer, response_policy_prompt
 from ..task_tracker import background_tasks
 from ..logger import chat_id_var, generation_fence_var, uid_var
 
@@ -190,7 +190,7 @@ async def process_chat(
     ):
         schedule_context = None
     calendar_resolution = None
-    length_context = response_policy_prompt(message)
+    length_context = response_policy_prompt(message, previous_answer=has_previous_answer(history_dicts[:-1]))
     academic_calendar_context = (
         calendar_prompt_context(calendar_query, calendar_resolution)
         if calendar_query

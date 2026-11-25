@@ -5,7 +5,8 @@ def test_main_prompt_supports_learning_and_mobile_markdown():
     prompt = get_system_prompt()
 
     assert "المعرفة الأكاديمية الراسخة" in prompt
-    assert "خطوة بخطوة" in prompt
+    assert "في أسئلة التعلم والحل" in prompt
+    assert "عندما يحتاجها الطالب أو يطلبها" in prompt
     assert "Markdown" in prompt
     assert "فضّل القوائم على الجداول العريضة" in prompt
     assert "كتل مسيجة" in prompt

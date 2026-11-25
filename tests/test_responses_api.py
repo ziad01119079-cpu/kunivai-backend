@@ -269,3 +269,61 @@ def test_provider_eof_without_completion_is_interruption():
     ):
         output = asyncio.run(run())
     assert json.loads(output[-1][6:].strip())["code"] == "LLM_STREAM_INTERRUPTED"
+
+
+
+def test_existing_inline_source_is_not_repeated_and_done_keeps_it():
+    url = "https://do.ku.edu.kw/ar/academic-calendar-0"
+    inline = f"راجع [التقويم الرسمي]({url})."
+    ann = SimpleNamespace(type="url_citation", url=url, title="التقويم الرسمي", start_index=0, end_index=len(inline))
+    response = SimpleNamespace(usage=None, output=[
+        SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", annotations=[ann])]),
+    ])
+    events = [
+        SimpleNamespace(type="response.output_text.delta", delta=inline),
+        SimpleNamespace(type="response.completed", response=response),
+    ]
+    client = SimpleNamespace(responses=SimpleNamespace(stream=lambda **_kwargs: _FakeStream(events)))
+
+    async def run():
+        return [json.loads(item[6:]) async for item in stream_response(
+            [{"role": "user", "content": "متى فترة التحويل؟"}], "prompt", tools=[]
+        )]
+
+    with (
+        patch("app.responses_api.get_openai_client", return_value=client),
+        patch("app.responses_api.get_config", return_value=SimpleNamespace(OPENAI_MODEL="gpt-4o")),
+    ):
+        payloads = asyncio.run(run())
+
+    assert [item["type"] for item in payloads] == ["chunk", "done"]
+    assert payloads[0]["content"] == inline
+    assert payloads[-1]["citations"][0]["url"] == url
+
+
+def test_retrieval_ceiling_and_followup_depth_are_not_clipped_by_short_default():
+    calls = []
+    response = SimpleNamespace(usage=None, output=[])
+    events = [SimpleNamespace(type="response.completed", response=response)]
+
+    def capture(**kwargs):
+        calls.append(kwargs)
+        return _FakeStream(events)
+
+    async def run():
+        async for _ in stream_response([{"role": "user", "content": "متى الموعد؟"}], "prompt", tools=[{"type": "web_search"}]):
+            pass
+        async for _ in stream_response([
+            {"role": "assistant", "content": "المشتقة معدل التغير"},
+            {"role": "user", "content": "اشرح أكتر"},
+        ], "prompt", tools=[]):
+            pass
+
+    with (
+        patch("app.responses_api.get_openai_client", return_value=SimpleNamespace(responses=SimpleNamespace(stream=capture))),
+        patch("app.responses_api.get_config", return_value=SimpleNamespace(OPENAI_MODEL="gpt-4o")),
+    ):
+        asyncio.run(run())
+
+    assert calls[0]["max_output_tokens"] >= 850
+    assert calls[1]["max_output_tokens"] > calls[0]["max_output_tokens"]
