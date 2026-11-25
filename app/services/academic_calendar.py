@@ -13,9 +13,10 @@ import re
 import ssl
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
+from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -100,6 +101,7 @@ class CalendarQuery:
     college_scope: CollegeScope = CollegeScope.GENERAL
     college_specified: bool = False
     audience: str | None = None
+    infer_semester_on: date | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,7 @@ class CalendarComparisonResolution:
     checked_at: datetime
     index_status: str = "verified"
     detail: str | None = None
+    resolved_query: CalendarQuery | None = None
 
     @property
     def records(self) -> tuple[VerifiedCalendarRecord, ...]:
@@ -354,13 +357,6 @@ def _normalize(text: str) -> str:
     return " ".join(text.split())
 
 
-def _extract_event(text: str) -> CalendarEvent | None:
-    for event, patterns in _EVENT_PATTERNS:
-        if any(re.search(pattern, text) for pattern in patterns):
-            return event
-    return None
-
-
 def _extract_semester(text: str) -> Semester | None:
     for semester, patterns in _SEMESTER_PATTERNS.items():
         if any(re.search(pattern, text) for pattern in patterns):
@@ -414,6 +410,42 @@ def _has_relative_year(text: str) -> bool:
     ))
 
 
+_DATE_QUESTION = re.compile(
+    r"متى|موعد|مواعيد|اخر (?:يوم|موعد|وقت)|تاريخ|فترة|when|deadline|what date|how long"
+)
+_EXPLANATION = re.compile(
+    r"ما الفرق|وش الفرق|شنو الفرق|اشرح|وضح|علمني|كيف (?:اسحب|اقدم|احول)|"
+    r"\b(?:explain|difference|compare|how (?:do|can|to))\b"
+)
+_AUDIENCES = {
+    "first_year": _AUDIENCE,
+    "second_year": r"(?:سن[هة] ثاني[هة]|السن[هة] الثاني[هة]|الفرق[هة] الثاني[هة]|second[ -]year)",
+    "graduate": r"(?:الدراسات العليا|طلب[هة] الماجستير|graduate (?:student|program)|postgraduate)",
+    "optional": r"(?:الاختياري|voluntary|optional)",
+}
+
+
+def _query_event(text: str) -> CalendarEvent | None:
+    if _EXPLANATION.search(text):
+        return None
+    if not _DATE_QUESTION.search(text):
+        return None
+    events = {event for event, patterns in _EVENT_PATTERNS if any(re.search(p, text) for p in patterns)}
+    if CalendarEvent.ADD_DROP in events:
+        events.discard(CalendarEvent.REGISTRATION)
+    if events:
+        return next(iter(events)) if len(events) == 1 else None
+    if re.search(r"\b(?:متى التحويل|when (?:is|does) (?:the )?transfer)\b", text):
+        return CalendarEvent.TRANSFER
+    if re.search(r"(?:فا+[ي]?ن[ا]?ل|فاينلات)", text) and not re.search(r"(?:فاينلي|فاينلاتي)", text):
+        return CalendarEvent.FINAL_EXAMS
+    return None
+
+
+def _audience(text: str) -> str | None:
+    return next((key for key, pattern in _AUDIENCES.items() if re.search(pattern, text)), None)
+
+
 def resolve_calendar_query(
     current_message: str,
     prior_messages_desc: list[dict],
@@ -424,9 +456,9 @@ def resolve_calendar_query(
     """Resolve calendar intent using current text and prior user turns only."""
     today = today or kuwait_today()
     current = _normalize(current_message)
-    event = _extract_event(current)
-    if event is None and re.search(r"(?:فا+[ي]?ن[ا]?ل|فاينلات)", current) and not re.search(r"(?:فاينلي|فاينلاتي)", current):
-        event = CalendarEvent.FINAL_EXAMS
+    if _EXPLANATION.search(current):
+        return None
+    event = _query_event(current)
     semester = _extract_semester(current)
     academic_year = _extract_academic_year(current)
     college = _extract_college(current)
@@ -436,7 +468,7 @@ def resolve_calendar_query(
         r"(?:شروط|طلبات|كيف|شلون|requirements|how (?:do|to|can))", current
     ) and not re.search(r"(?:متى|موعد|اخر|when|deadline)", current):
         return None
-    audience = "first_year" if re.search(_AUDIENCE, current) else None
+    audience = _audience(current)
     is_follow_up = len(current.split()) <= 13 and any(
         re.search(pattern, current) for pattern in _FOLLOW_UP_MARKERS
     )
@@ -446,9 +478,7 @@ def resolve_calendar_query(
     if is_follow_up:
         for message in [row for row in prior_messages_desc if row.get("isUser", True)][:4]:
             prior = _normalize(str(message.get("content", "")))
-            prior_event = _extract_event(prior)
-            if prior_event is None and re.search(r"(?:فا+[ي]?ن[ا]?ل|فاينلات)", prior):
-                prior_event = CalendarEvent.FINAL_EXAMS
+            prior_event = _query_event(prior)
             if prior_event:
                 if event is not None and event != prior_event:
                     break
@@ -474,8 +504,7 @@ def resolve_calendar_query(
         if college is None:
             college = _extract_college(prior)
             college_specified = college is not None
-        if audience is None and re.search(_AUDIENCE, prior):
-            audience = "first_year"
+        audience = audience or _audience(prior)
 
     if college is None and re.search(r"(?:كليتي|my college)", current):
         college = _college_from_schedule(schedule_college)
@@ -488,6 +517,7 @@ def resolve_calendar_query(
         college_scope=college or CollegeScope.GENERAL,
         college_specified=college_specified,
         audience=audience,
+        infer_semester_on=today if semester is None and academic_year in (None, current_year) else None,
     )
 
 
@@ -500,10 +530,15 @@ class _VisibleTextParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.ignored_depth = 0
+        self.div_cards: list[bool] = []
 
     def handle_starttag(self, tag: str, attrs) -> None:
         if tag in {"script", "style", "noscript", "svg"}:
             self.ignored_depth += 1
+        elif tag == "div":
+            card = "sui-calendar" in (dict(attrs).get("class") or "").split()
+            self.div_cards.append(card)
+            self.parts.append("\n|calendar-row-start|\n" if card else "\n")
         elif tag == "tr":
             self.parts.append("\n|calendar-row-start|\n")
         elif tag in self._BLOCK_TAGS:
@@ -512,6 +547,8 @@ class _VisibleTextParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style", "noscript", "svg"} and self.ignored_depth:
             self.ignored_depth -= 1
+        elif tag == "div" and self.div_cards:
+            self.parts.append("\n|calendar-row-end|\n" if self.div_cards.pop() else "\n")
         elif tag == "tr":
             self.parts.append("\n|calendar-row-end|\n")
         elif tag in self._BLOCK_TAGS:
@@ -526,6 +563,7 @@ class _VisibleTextParser(HTMLParser):
         return "\n".join(line for line in lines if line)
 
 
+@lru_cache(maxsize=24)
 def _visible_text(html: str) -> str:
     parser = _VisibleTextParser()
     parser.feed(html)
@@ -627,14 +665,21 @@ def _date_from_match(match: re.Match[str]) -> date | None:
         return None
 
 
-def _date_belongs_to_term(value: date, query: CalendarQuery) -> bool:
+def _date_belongs_to_term(value: date, query: CalendarQuery, *, summer_start: date | None) -> bool:
     start_year = int(query.academic_year.split("/")[0])
     if not date(start_year, 9, 1) <= value <= date(start_year + 1, 8, 31):
         return False
     if query.semester is Semester.FIRST:
         return date(start_year, 9, 1) <= value <= date(start_year + 1, 1, 31)
     if query.semester is Semester.SECOND:
-        return date(start_year + 1, 1, 1) <= value <= date(start_year + 1, 5, 31)
+        # A published Spring transfer window can extend into early June.
+        # Use the same source's summer boundary when available, with a
+        # bounded early-June allowance for an independently scoped card.
+        end = date(start_year + 1, 5, 31)
+        if query.event in {CalendarEvent.TRANSFER, CalendarEvent.GRADE_SUBMISSION}:
+            early_june = date(start_year + 1, 6, 15)
+            end = min(early_june, summer_start - timedelta(days=1)) if summer_start else early_june
+        return date(start_year + 1, 1, 1) <= value <= end
     return date(start_year + 1, 6, 1) <= value <= date(start_year + 1, 8, 31)
 
 
@@ -681,6 +726,12 @@ def verify_official_calendar_html(
 
     text = _visible_text(html)
     records: list[VerifiedCalendarRecord] = []
+    inconsistent_date = False
+    summer_start = None
+    if query.event in {CalendarEvent.TRANSFER, CalendarEvent.GRADE_SUBMISSION} and query.semester is Semester.SECOND:
+        start_query = replace(query, event=CalendarEvent.START_OF_CLASSES, semester=Semester.SUMMER, audience=None)
+        summer_record = _verified_record(verify_official_calendar_html(start_query, html, source, checked_at=checked_at))
+        summer_start = summer_record.start_date if summer_record else None
     for event_match in _event_matches(text, query):
         year, semester = _nearest_preceding_context(text, event_match.start())
         if year != query.academic_year or semester is not query.semester:
@@ -713,16 +764,21 @@ def verify_official_calendar_html(
             if window_end < 0:
                 window_end = len(text)
         window = text[window_start:window_end]
-        if query.audience == "first_year" and not re.search(_AUDIENCE, window):
+        if query.audience and not re.search(_AUDIENCES[query.audience], window):
             continue
         candidates: list[tuple[int, int, date]] = []
+        invalid_date = False
         for date_match in _DATE_RE.finditer(window):
             parsed = _date_from_match(date_match)
-            if parsed is None or not _date_belongs_to_term(parsed, query):
+            if parsed is None or not _date_belongs_to_term(parsed, query, summer_start=summer_start):
+                invalid_date = True
                 continue
             absolute_start = window_start + date_match.start()
             distance = min(abs(absolute_start - event_match.start()), abs(absolute_start - event_match.end()))
             candidates.append((distance, absolute_start, parsed))
+        if in_row and invalid_date:
+            inconsistent_date = True
+            continue
         if not candidates:
             continue
 
@@ -731,29 +787,31 @@ def verify_official_calendar_html(
         else:
             preferred = [item for item in candidates if item[1] <= event_match.start()]
         candidates = preferred or candidates
-        candidates.sort(key=lambda item: item[0])
-        closest_distance = candidates[0][0]
-        selected = [candidates[0][2]]
+        closest = min(candidates)
+        selected = [closest[2]]
         if query.event in _RANGE_EVENTS:
             selected = list(dict.fromkeys(
-                value for distance, _position, value in candidates
-                if in_row or distance <= closest_distance + 45
-            ))[:2]
-        if query.event in _RANGE_EVENTS and len(selected) < 2:
-            continue
+                value for distance, _position, value in sorted(candidates, key=lambda item: item[1])
+                if in_row or distance <= closest[0] + 45
+            ))
+            if len(selected) != 2 or selected[0] > selected[1]:
+                inconsistent_date |= len(selected) >= 2
+                continue
         records.append(VerifiedCalendarRecord(
             query.event,
             query.academic_year,
             query.semester,
             query.college_scope,
-            min(selected),
-            max(selected),
+            selected[0],
+            selected[-1],
             source.url,
             source.title_ar,
             " ".join(window.split()),
             checked_at,
         ))
 
+    if inconsistent_date:
+        return EvidenceResolution("conflict", tuple(records), source, checked_at, "inconsistent date in applicable source block")
     if not records:
         return EvidenceResolution(
             "missing", (), source, checked_at, "no exact event/term/scope match on official page"
@@ -868,6 +926,7 @@ async def _fetch_html(url: str) -> str:
 def clear_calendar_content_cache() -> None:
     """Test/operations hook; cached values are official response bodies only."""
     _CONTENT_CACHE.clear()
+    _visible_text.cache_clear()
 
 
 async def _cached_official_html(
@@ -906,6 +965,23 @@ async def _cached_official_html(
     return await asyncio.shield(task)
 
 
+def _with_published_semester(query: CalendarQuery, html: str, source: OfficialCalendarSource,
+                             checked_at: datetime) -> CalendarQuery:
+    if query.infer_semester_on is None:
+        return query
+    started = []
+    for semester in Semester:
+        start = replace(query, event=CalendarEvent.START_OF_CLASSES, semester=semester,
+                        college_scope=source.scope, audience=None, infer_semester_on=None)
+        record = _verified_record(verify_official_calendar_html(start, html, source, checked_at=checked_at))
+        if record is None:
+            # Partial schedules cannot establish a transition reliably.
+            return query
+        if record.start_date <= query.infer_semester_on:
+            started.append((record.start_date, semester))
+    return replace(query, semester=max(started)[1] if started else Semester.FIRST)
+
+
 async def lookup_official_calendar(
     query: CalendarQuery,
     *,
@@ -942,8 +1018,8 @@ async def lookup_official_calendar(
             detail=unavailable.detail,
         )
 
-    general_query = CalendarQuery(
-        query.event, query.academic_year, query.semester, CollegeScope.GENERAL, audience=query.audience
+    general_query = _with_published_semester(
+        replace(query, college_scope=CollegeScope.GENERAL), index_html, general_source, checked_at
     )
     general = verify_official_calendar_html(
         general_query, index_html, general_source, checked_at=checked_at
@@ -965,10 +1041,8 @@ async def lookup_official_calendar(
         # special-calendar landscape rather than assuming the general date.
         selected = discovered
 
-    async def verify_source(source: OfficialCalendarSource) -> EvidenceResolution:
-        source_query = CalendarQuery(
-            query.event, query.academic_year, query.semester, source.scope, True, query.audience
-        )
+    async def verify_source(source: OfficialCalendarSource) -> tuple[EvidenceResolution, Semester]:
+        source_query = replace(query, college_scope=source.scope, college_specified=True)
         try:
             html = await _cached_official_html(
                 source.url,
@@ -978,22 +1052,29 @@ async def lookup_official_calendar(
             )
         except Exception as exc:
             return EvidenceResolution(
-                "unavailable",
-                (),
-                source,
-                checked_at,
+                "unavailable", (), source, checked_at,
                 f"official source fetch failed: {type(exc).__name__}",
-            )
-        return verify_official_calendar_html(
-            source_query, html, source, checked_at=checked_at
-        )
+            ), general_query.semester
+        if query.college_specified and source.scope is query.college_scope:
+            source_query = _with_published_semester(source_query, html, source, checked_at)
+        else:
+            source_query = replace(source_query, semester=general_query.semester)
+        return verify_official_calendar_html(source_query, html, source, checked_at=checked_at), source_query.semester
 
-    special = tuple(await asyncio.gather(*(verify_source(source) for source in selected)))
+    checked = await asyncio.gather(*(verify_source(source) for source in selected))
+    special = tuple(item for item, _ in checked)
+    resolved_semester = next((semester for item, semester in checked if
+        query.college_specified and item.source.scope is query.college_scope), general_query.semester)
+    if resolved_semester is not general_query.semester:
+        general = verify_official_calendar_html(
+            replace(general_query, semester=resolved_semester), index_html, general_source, checked_at=checked_at
+        )
     return CalendarComparisonResolution(
         general,
         special,
         tuple(source.scope for source in discovered),
         checked_at,
+        resolved_query=replace(query, semester=resolved_semester),
     )
 
 
@@ -1021,8 +1102,56 @@ def format_calendar_answer(
     english: bool = False,
 ) -> str:
     if isinstance(resolution, CalendarComparisonResolution):
-        return _format_comparison_answer(query, resolution, english=english)
-    return _format_single_calendar_answer(query, resolution, english=english)
+        query = resolution.resolved_query or query
+        answer = _format_comparison_answer(query, resolution, english=english)
+        requested = next((item for item in resolution.special if item.source and item.source.scope is query.college_scope), None)
+        applicable = requested if query.college_specified and query.college_scope is not CollegeScope.GENERAL else resolution.general
+    else:
+        answer = _format_single_calendar_answer(query, resolution, english=english)
+        applicable = resolution
+
+    record = _verified_record(applicable) if applicable else None
+    today = resolution.checked_at.astimezone(KUWAIT_TZ).date()
+    if record and isinstance(resolution, CalendarComparisonResolution):
+        term_labels = {
+            Semester.FIRST: ("الفصل الأول", "Fall semester"),
+            Semester.SECOND: ("الفصل الثاني", "Spring semester"),
+            Semester.SUMMER: ("الفصل الصيفي", "Summer semester"),
+        }
+        term = term_labels[record.semester][int(english)]
+        answer += f"\n\n{term} · {record.academic_year}."
+        if record.event is CalendarEvent.ENROLLMENT_SUSPENSION:
+            optional_scopes = [
+                _scope_name(item.source.scope, english=english)
+                for item in (resolution.general, *resolution.special)
+                if item.source and (optional := _verified_record(item))
+                and _audience(optional.supporting_excerpt) == "optional"
+            ]
+            if optional_scopes:
+                scopes = ", ".join(optional_scopes)
+                answer += (f" Optional suspension only in {scopes}." if english else
+                           f" تاريخ وقف القيد الاختياري فقط في: {scopes}.")
+    if record and record.end_date < today and query.event in {
+        CalendarEvent.COURSE_WITHDRAWAL, CalendarEvent.ENROLLMENT_SUSPENSION,
+        CalendarEvent.FULL_SEMESTER_WITHDRAWAL, CalendarEvent.GRADE_SUBMISSION,
+        CalendarEvent.TRANSFER, CalendarEvent.ADD_DROP, CalendarEvent.REGISTRATION,
+    }:
+        scope = _scope_name(record.college_scope, english=english)
+        answer += (f"\n\nThis deadline has passed for {scope}." if english else f"\n\nانقضى هذا الموعد ({scope}).")
+    if record:
+        return answer
+    if applicable and applicable.status == "conflict":
+        answer += ("\n\nThe applicable official calendar contains conflicting date information." if english else
+                   "\n\nيتضمن التقويم الرسمي المطبق بيانات متعارضة عن الموعد.")
+    if query.college_scope is CollegeScope.LAW:
+        contact = "https://law.ku.edu.kw/ar/students/guidance-and-counseling"
+        answer += (f"\n\nAsk the [Law guidance office]({contact}) for the applicable timetable." if english else
+                   f"\n\nللحصول على الجدول المطبق، تواصل مع [مكتب التوجيه والإرشاد بكلية الحقوق]({contact}).")
+    else:
+        contact = "https://do.ku.edu.kw/ar"
+        answer += (f"\n\nCheck the [Deanship of Admission and Registration]({contact}) for a dated announcement." if english else
+                   f"\n\nتحقق من [عمادة القبول والتسجيل]({contact}) لمعرفة الإعلان المؤرخ للموعد.")
+    return answer
 
 
 def _scope_name(scope: CollegeScope, *, english: bool) -> str:

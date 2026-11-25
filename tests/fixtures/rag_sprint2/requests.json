@@ -1,0 +1,129 @@
+[
+  [
+    "mixed-guide",
+    "ارسل رابط دليل الطالب واشرح لي كيف أستعد لأول أسبوع",
+    [],
+    false,
+    "guide"
+  ],
+  [
+    "mixed-registration",
+    "عطني رابط تسجيل المقررات واشرح شلون أضيف مقرر",
+    [],
+    false,
+    "registration"
+  ],
+  [
+    "club-affiliation",
+    "اشرح معنى أن يكون نادي طلابي تابع للجامعة وكيف ينظم فعاليات",
+    [],
+    false,
+    "academic"
+  ],
+  [
+    "site-affiliation",
+    "اشرح كيف أتحقق هل موقع تابع لجامعة الكويت",
+    [],
+    false,
+    "academic"
+  ],
+  [
+    "gemini-programming",
+    "Explain how to write Python code using Gemini.",
+    [],
+    false,
+    "academic"
+  ],
+  [
+    "gemini-topic-switch",
+    "اشرح طريقة كتابة كود بلغة بايثون",
+    [
+      "كيف أدخل Gemini Enterprise؟"
+    ],
+    false,
+    "academic"
+  ],
+  [
+    "gpa-example",
+    "اشرح كيف أحسب معدل التخصص واعطني مثالًا محلولًا",
+    [],
+    false,
+    "formula"
+  ],
+  [
+    "warning-general",
+    "اشرح كيف ترفع الجامعات الإنذار الأكاديمي بصفة عامة",
+    [],
+    false,
+    "academic"
+  ],
+  [
+    "warning-provided",
+    "هل يروح الإنذار الأكاديمي لو جبت B بأربع مواد، كل مادة 3 وحدات، ومعدلي العام 1.8 من 36 وحدة؟",
+    [],
+    false,
+    "standing"
+  ],
+  [
+    "exam-explanation",
+    "ما الفرق بين اختبار الميد والفاينل؟",
+    [],
+    false,
+    "academic"
+  ],
+  [
+    "schedule-followup",
+    "ساعدني أعمل خطة مذاكرة بناءً على اللي قلناه",
+    [
+      "اعرض جدول محاضراتي"
+    ],
+    true,
+    "schedule"
+  ],
+  [
+    "hold-file",
+    "اكتب ملخصًا مبسطًا من الملف الذي رفعته",
+    [
+      "أرسلت ملف المحاضرة"
+    ],
+    false,
+    "file"
+  ],
+  [
+    "hold-pronoun",
+    "وهل ممكن تشرحه بطريقة أبسط؟",
+    [
+      "اشرح لي المشتقة من تعريف النهاية"
+    ],
+    false,
+    "academic"
+  ],
+  [
+    "hold-mixed-date",
+    "متى آخر يوم سحب مواد في التقويم العام، واشرح الفرق بين السحب والانسحاب الكلي",
+    [],
+    false,
+    "mixed_date"
+  ],
+  [
+    "hold-link-only",
+    "وين رابط دليل الطالب؟",
+    [],
+    false,
+    "direct_guide"
+  ],
+  [
+    "hold-arithmetic",
+    "كم يساوي ٢ + ٣؟",
+    [],
+    false,
+    "arithmetic"
+  ],
+  [
+    "hold-law-first-year",
+    "متى فاينل سنة أولى في كلية الحقوق؟",
+    [],
+    false,
+    "law_uncertain"
+  ]
+]

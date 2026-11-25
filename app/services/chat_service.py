@@ -13,7 +13,8 @@ from typing import AsyncIterator
 from ..prompts import get_system_prompt, get_web_search_prompt
 from .query_router import (
     QueryIntent,
-    classify_query,
+    contextual_query_intent,
+    is_general_academic_explanation,
     ku_web_search_tool,
     should_fallback_to_web,
 )
@@ -38,7 +39,7 @@ from ..schedule_repository import load_user_schedules
 from .schedule_context import build_schedule_context
 from .grounding import applicable_citations, missing_evidence_answer, needs_authoritative_policy, sanitize_university_id_answer
 from .provider_usage import UsageTrace, current_usage
-from .verified_answers import known_answer
+from .verified_answers import arithmetic_match, known_answer, request_clauses
 from .response_policy import response_policy_prompt
 from ..task_tracker import background_tasks
 from ..logger import chat_id_var, generation_fence_var, uid_var
@@ -150,15 +151,42 @@ async def process_chat(
         if str((schedule.get("student") or {}).get("college") or "").strip()
     }
     schedule_college = next(iter(schedule_colleges)) if len(schedule_colleges) == 1 else None
-    intent = classify_query(message)
-    direct_answer = known_answer(message, raw_messages)
-    calendar_query = resolve_calendar_query(
-        message, raw_messages, schedule_college=schedule_college,
-    ) if direct_answer is None and intent is not QueryIntent.PERSONAL_SCHEDULE else None
-    # Explicit general study requests can omit mounted schedule data. Preserve
-    # it for follow-ups and uncertain routes where the record may matter.
-    if intent is QueryIntent.GENERAL_EDUCATIONAL and len(message.split()) >= 4 and not any(
-        key in message.casefold() for key in ("جدول", "معدل", "مسجل", "منهجي", "مقرري", "درجات", "مادتي", "بيانات", "my ", "grade", "gpa", "schedule", "المثال", "السابق", "هذا", "هذي", "it ", "previous", "above")
+    clauses = request_clauses(message)
+    is_mixed = len(clauses) > 1
+    direct_answer = None if is_mixed else known_answer(message, raw_messages)
+    calendar_query = None
+    verified_parts = []
+    remaining = []
+    for clause in clauses if is_mixed else [message]:
+        answered = known_answer(clause, []) if is_mixed else direct_answer
+        if answered is not None:
+            if is_mixed and (answered.sources or arithmetic_match(clause)):
+                verified_parts.append(answered)
+            elif is_mixed:
+                remaining.append(clause)
+            continue
+        clause_intent = contextual_query_intent(clause, raw_messages)
+        candidate = resolve_calendar_query(clause, [] if is_mixed else raw_messages, schedule_college=schedule_college) if (
+            clause_intent is not QueryIntent.PERSONAL_SCHEDULE
+        ) else None
+        if candidate and calendar_query is None:
+            calendar_query = candidate
+        else:
+            remaining.append(clause)
+    remaining_question = " ".join(remaining) if is_mixed else message
+    intent = contextual_query_intent(remaining_question, raw_messages)
+    needs_generation = is_mixed and bool(remaining)
+
+    # A standalone lesson without attached context can omit schedules. Once
+    # a conversation or attachment exists, topic keywords alone cannot prove
+    # the records are irrelevant to a reference such as "based on that".
+    if (
+        intent is QueryIntent.GENERAL_EDUCATIONAL and not raw_messages and not system_context
+        and not is_mixed and len(message.split()) >= 4
+        and not any(key in message.casefold() for key in (
+            "جدول", "معدل", "مسجل", "مقرري", "درجات", "مادتي", "بيانات", "الملف",
+            "قسمي", "my ", "grade", "gpa", "schedule", "uploaded",
+        ))
     ):
         schedule_context = None
     calendar_resolution = None
@@ -180,7 +208,11 @@ async def process_chat(
 
     # 4. Current-information requests go straight to the web; static official
     # and uncertain university intent retain the File Search -> web fallback.
-    require_official = needs_authoritative_policy(message)
+    require_official = (
+        intent is not QueryIntent.PERSONAL_SCHEDULE
+        and not is_general_academic_explanation(remaining_question)
+        and needs_authoritative_policy(remaining_question)
+    )
     use_web_search = intent is QueryIntent.TIME_SENSITIVE_UNIVERSITY
     use_file_search = (require_official and not use_web_search) or intent in {
         QueryIntent.OFFICIAL_UNIVERSITY,
@@ -272,7 +304,8 @@ async def process_chat(
     user_save_task.add_done_callback(background_tasks.tasks.discard)
 
     trace = UsageTrace(route=(
-        "verified_direct" if direct_answer else "official_calendar" if calendar_query else intent.value
+        "mixed_verified" if needs_generation and (verified_parts or calendar_query) else
+        "verified_direct" if direct_answer or verified_parts else "official_calendar" if calendar_query else intent.value
     ))
     trace_token = current_usage.set(trace)
 
@@ -283,6 +316,18 @@ async def process_chat(
             return missing_evidence_answer(message), []
         safe_answer, _ = sanitize_university_id_answer(message, answer, evidence)
         return safe_answer, applicable
+
+    local_texts = []
+    local_prefix_length = 0
+
+    def add_provider_citations(items: list[dict]) -> None:
+        for item in items:
+            if local_prefix_length:
+                item = item.copy()
+                for key in ("start_index", "end_index", "index"):
+                    if type(item.get(key)) is int:
+                        item[key] += local_prefix_length
+            accumulated_citations.append(item)
 
     try:
         initial_status = (
@@ -305,38 +350,44 @@ async def process_chat(
         else:
             user_message_saved = await asyncio.shield(user_save_task)
 
-        if direct_answer is not None:
-            citations = direct_answer.citations()
-            accumulated_text.append(direct_answer.text)
-            accumulated_citations.extend(citations)
-            yield "data: " + json.dumps({"type": "chunk", "content": direct_answer.text}) + "\n\n"
-            done_payload = {"type": "done", "citations": citations}
-        elif calendar_query is not None:
-            answer = format_calendar_answer(
-                calendar_query,
-                calendar_resolution,
-                english=is_english_message(message),
-            )
-            citations = [
-                {
-                    "type": "url_citation",
-                    "url": source.url,
-                    "title": (
-                        source.title_en
-                        if is_english_message(message)
-                        else source.title_ar
-                    ),
-                    "start_index": 0,
-                    "end_index": 0,
-                }
-                for source in calendar_resolution.citation_sources
-            ]
-            accumulated_text.append(answer)
-            accumulated_citations.extend(citations)
-            yield "data: " + json.dumps(
-                {"type": "chunk", "content": answer}
-            ) + "\n\n"
-            done_payload = {"type": "done", "citations": citations}
+        local_citations = []
+        for result in ([direct_answer] if direct_answer else verified_parts):
+            local_texts.append(result.text)
+            local_citations.extend(result.citations())
+        if calendar_query is not None:
+            local_texts.append(format_calendar_answer(
+                calendar_query, calendar_resolution, english=is_english_message(message)
+            ))
+            local_citations.extend({
+                "type": "url_citation",
+                "url": source.url,
+                "title": source.title_en if is_english_message(message) else source.title_ar,
+                "start_index": 0,
+                "end_index": 0,
+            } for source in calendar_resolution.citation_sources)
+
+        if local_texts:
+            local_text = "\n\n".join(local_texts)
+            accumulated_citations.extend(local_citations)
+            if needs_generation:
+                # The deterministic part has already been verified and will
+                # be rendered separately. The model sees the original turn.
+                continuation = (
+                    "The verified application answer below is already shown. Complete every remaining subtask "
+                    "from the user's full request. Avoid repeating or changing that evidence. Its sources support "
+                    "only that part, so retrieve separate evidence for new KU policy claims where required. "
+                    "Use inputs already supplied in this conversation. Ask only for missing inputs.\n"
+                    "<verified_application_answer>\n" + local_text + "\n</verified_application_answer>"
+                )
+                academic_calendar_context += "\n\n" + continuation
+                system_prompt = get_system_prompt(system_context, schedule_context, academic_calendar_context)
+                local_text += "\n\n"
+                local_prefix_length = len(local_text)
+            accumulated_text.append(local_text)
+            yield "data: " + json.dumps({"type": "chunk", "content": local_text}) + "\n\n"
+
+        if local_texts and not needs_generation:
+            done_payload = {"type": "done", "citations": local_citations}
         elif use_web_search:
             web_text: list[str] = []
             web_citations: list[dict] = []
@@ -369,7 +420,7 @@ async def process_chat(
                 return
             answer, web_citations = verify_retrieval("".join(web_text).strip(), web_citations, web_evidence)
             accumulated_text.append(answer)
-            accumulated_citations.extend(web_citations)
+            add_provider_citations(web_citations)
             yield "data: " + json.dumps(
                 {"type": "chunk", "content": answer}
             ) + "\n\n"
@@ -414,7 +465,7 @@ async def process_chat(
                     retrieved_answer,
                     retrieved_evidence,
                 )
-                accumulated_citations.extend(retrieved_citations)
+                add_provider_citations(retrieved_citations)
                 done_payload = retrieved_done or {
                     "type": "done",
                     "citations": retrieved_citations,
@@ -471,7 +522,7 @@ async def process_chat(
                     return
                 safe_answer, web_citations = verify_retrieval("".join(web_text).strip(), web_citations, web_evidence)
                 accumulated_text.append(safe_answer)
-                accumulated_citations.extend(web_citations)
+                add_provider_citations(web_citations)
                 yield "data: " + json.dumps(
                     {"type": "chunk", "content": safe_answer}
                 ) + "\n\n"
@@ -490,7 +541,7 @@ async def process_chat(
                     if payload.get("type") == "chunk":
                         accumulated_text.append(payload.get("content", ""))
                     elif payload.get("type") == "done":
-                        accumulated_citations.extend(payload.get("citations", []))
+                        add_provider_citations(payload.get("citations", []))
                 if payload is not None and payload.get("type") == "done":
                     done_payload = payload
                 else:
@@ -499,6 +550,16 @@ async def process_chat(
         # `done` means both messages have been committed in order (or that a
         # persistence failure was logged).  This makes immediate follow-ups see
         # the complete preceding turn and keeps `done` the final SSE event.
+        if local_citations:
+            seen = set()
+            unique_citations = []
+            for citation in accumulated_citations:
+                key = citation.get("url") or citation.get("file_id")
+                if key and key in seen:
+                    continue
+                seen.add(key)
+                unique_citations.append(citation)
+            accumulated_citations[:] = unique_citations
         persisted = await persist_assistant_message()
         if done_payload is not None and generation_claim is not None and not persisted:
             yield 'data: ' + json.dumps({
@@ -533,7 +594,7 @@ async def process_chat(
         # 8. Background Task: Missed Query Analytics
         was_file_search_attempted = file_search_attempted
         try:
-            should_analyze = direct_answer is None and calendar_query is None and not provider_failed and (
+            should_analyze = (not local_texts or needs_generation) and not provider_failed and (
                 (was_file_search_attempted and not accumulated_citations) or "عذراً" in final_text
             )
             if should_analyze:

@@ -158,6 +158,8 @@ _OFFICIAL_PATTERNS = (
 )
 
 _EDUCATIONAL_PATTERNS = (
+    r"(?:ما|شنو|وش) الفرق بين (?:اختبار )?(?:الميد|الفاينل)",
+    r"\bdifference between (?:a |the )?(?:midterm|final exam)\b",
     r"(?:اشرح|فسر|وضّح|وضح|لخص|علمني|ساعدني|حل|احسب|راجع|اختبرني|سو[ّي]? لي|اعطني|أعطني).{0,80}",
     r"(?:رياضيات|جبر|تفاضل|تكامل|إحصاء|احصاء|اقتصاد|محاسبة|برمجة|فيزياء|كيمياء|أحياء|احياء|إدارة أعمال|ادارة اعمال|تمويل|هندسة|خوارزمية|بايثون|جافا|قواعد البيانات|علم النفس|علم الاجتماع)",
     r"(?:explain|summari[sz]e|teach|solve|calculate|quiz|revision|study|homework|assignment|give me an example).{0,80}",
@@ -200,11 +202,25 @@ def is_time_sensitive_query(user_message: str) -> bool:
     )
 
 
+def is_general_academic_explanation(question: str) -> bool:
+    """General concepts and verification methods do not assert institutional policy."""
+    text = _normalize(question).translate(str.maketrans("أإآ", "ااا"))
+    teaches = re.match(r"(?:اشرح|وضح|علمني|explain|teach me|how (?:do|can) i verify)\b", text)
+    if not teaches:
+        return False
+    if re.search(r"(?:كيف اتحقق|كيف اتاكد|how (?:to|do i|can i) (?:check|verify))", text):
+        return bool(re.search(r"(?:موقع|مصدر|انتساب|website|source|affiliation)", text))
+    return bool(re.search(r"(?:الجامعات|universities)\b.{0,80}(?:بصفة عامة|بشكل عام|عموم[ًاا]*|in general)", text)
+                and not re.search(r"جامعة الكويت|kuwait university", text))
+
+
 def classify_query(user_message: str) -> QueryIntent:
     """Classify a request without adding model latency or token cost."""
     text = _normalize(user_message)
     if is_user_schedule_query(text):
         return QueryIntent.PERSONAL_SCHEDULE
+    if is_general_academic_explanation(text):
+        return QueryIntent.GENERAL_EDUCATIONAL
     if text in _CASUAL_EXACT or _matches_any(_CONVERSATIONAL_FOLLOW_UP_PATTERNS, text):
         return QueryIntent.CASUAL_UNIVERSITY
     if is_time_sensitive_query(text):
@@ -227,3 +243,27 @@ def should_use_file_search(user_message: str) -> bool:
         QueryIntent.OFFICIAL_UNIVERSITY,
         QueryIntent.UNCERTAIN,
     }
+
+
+_CONTEXTUAL = re.compile(
+    r"^(?:و?(?:هل ممكن |ممكن )?(?:تشرح[هها]*|توضح[هها]*|اشرح[هها]*|وضح[هها]*) (?:بطريق[هة] )?(?:ابسط|اسهل|اكثر)|"
+    r"ساعدني .{0,50}(?:بناء على|حسب) (?:اللي|الي|ما) (?:قلناه|ذكرناه|تكلمنا عنه)|"
+    r"what about|can you explain (?:it|that)|based on (?:that|what we discussed))"
+)
+_FILE_REFERENCE = re.compile(r"الملف (?:الذي|اللي) (?:رفعته|ارسلته)|(?:my|the) uploaded (?:file|schedule)|(?:the )?file i uploaded")
+
+
+def contextual_query_intent(question: str, prior_messages_desc: list[dict]) -> QueryIntent:
+    """Use a preceding user topic only for a recognizable continuation."""
+    text = _normalize(question).translate(str.maketrans("أإآ", "ااا"))
+    text = re.sub(r"[\u064b-\u065f]", "", text)
+    if _FILE_REFERENCE.search(text):
+        return QueryIntent.PERSONAL_SCHEDULE
+    intent = classify_query(question)
+    if not _CONTEXTUAL.search(text):
+        return intent
+    previous = next((str(row.get("content", "")) for row in prior_messages_desc if row.get("isUser", True)), "")
+    prior_intent = classify_query(previous)
+    if prior_intent in {QueryIntent.PERSONAL_SCHEDULE, QueryIntent.GENERAL_EDUCATIONAL}:
+        return prior_intent
+    return intent
