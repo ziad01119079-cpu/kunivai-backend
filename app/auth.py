@@ -148,3 +148,49 @@ async def verify_admin(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Admin privileges required.",
     )
+
+
+async def verify_community_evidence_verifier(
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
+) -> str:
+    """Verify dedicated independent Community Evidence Verifier authority (C1).
+
+    Requires Firebase Auth custom claim `community_evidence_verifier=True`
+    (separate from generic `admin` upload/moderation privileges).
+    """
+    try:
+        decoded = await _decode_token(
+            credentials.credentials,
+            check_revoked=not enabled(),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid, expired, or revoked Firebase ID token.",
+        ) from exc
+
+    uid = decoded["uid"]
+    if enabled():
+        validate_environment()
+        return uid
+
+    try:
+        if await _admin_access_is_blocked(uid):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Verifier access has been revoked.",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Verifier authorization is temporarily unavailable.",
+        ) from exc
+
+    if decoded.get("community_evidence_verifier") is True:
+        return uid
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Dedicated community_evidence_verifier role required.",
+    )

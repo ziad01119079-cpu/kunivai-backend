@@ -47,6 +47,7 @@ from app.routers import (
     admin_users_router,
     assets_router,
     chat_router,
+    community_admin_router,
     notifications_router,
     schedules_router,
     upload_router,
@@ -181,6 +182,7 @@ app.include_router(upload_router)
 app.include_router(admin_users_router)
 app.include_router(assets_router)
 app.include_router(chat_router)
+app.include_router(community_admin_router)
 app.include_router(schedules_router)
 app.include_router(notifications_router)
 

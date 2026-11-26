@@ -14,6 +14,8 @@ from enum import Enum
 class QueryIntent(str, Enum):
     TIME_SENSITIVE_UNIVERSITY = "time_sensitive_university"
     OFFICIAL_UNIVERSITY = "official_university"
+    COMMUNITY_OPINION = "community_opinion"
+    MIXED_OFFICIAL_COMMUNITY = "mixed_official_community"
     UNCERTAIN = "uncertain"
     PERSONAL_SCHEDULE = "personal_schedule"
     GENERAL_EDUCATIONAL = "general_educational"
@@ -132,6 +134,31 @@ _POLICY_REQUESTS = (
     r"(?:التشغيل الطلابي|توظيف الطلبة|(?:السكن|الاسكان|الإسكان) الطلابي|صندوق الطلبة|المدة الاعتيادية للتخرج|التحويل الداخلي|التخصص النادر|التخصصات النادرة|التبادل الطلابي|النقل الجامعي|الباص الجامعي|student employment|student housing)",
     r"(?:شروط|ضوابط|لائحة|قواعد|عقوبة|عقوبات|عند الجامعة|جامعة الكويت).{0,45}(?:الانذار|الإنذار|الغش|العبء الدراسي|تأجيل (?:الاختبار|الامتحان)|الصيفي)",
     r"(?:الانذار|الإنذار|الغش|العبء الدراسي|تأجيل (?:الاختبار|الامتحان)|الصيفي).{0,40}(?:شروط|ضوابط|لائحة|قواعد|عقوبة|عقوبات|جامعة الكويت)",
+    r"(?:كم|ما|شنو).{0,15}(?:وحدة|وحدات).{0,20}(?:أقدر|اقدر|مسموح|أسجل|اسجل)",
+    r"(?:إعادة|اعادة) المقرر.{0,35}(?:الأعلى|الاعلى|الثاني|المعدل|تحتسب|يحسبون)",
+    r"(?:احسب|حساب).{0,20}المعدل.{0,25}(?:حسب|وفق|بموجب).{0,15}اللائحة",
+)
+
+_CURRENT_CAMPUS_FACT_PATTERNS = (
+    r"(?:هل|اذا|إذا).{0,35}(?:مطعم|كافيه|كافتيريا|مكتبة|مبنى|عمادة).{0,25}(?:مفتوح|مفتوحة|فاتح|شغال|مغلق|مسكر).{0,15}(?:الحين|الآن|الان|اليوم)",
+    r"(?:مطعم|كافيه|كافتيريا).{0,25}(?:مفتوح|فاتح|يسكر|يفتح).{0,15}(?:الحين|الآن|الان|اليوم)",
+    r"\b(?:is|are)\b.{0,30}\b(?:restaurant|cafe|cafeteria|library|office)\b.{0,20}\b(?:open now|currently open|open today)\b",
+)
+
+_COMMUNITY_OPINION_PATTERNS = (
+    r"(?:رأي|راي|آراء|اراء|تجربة|تجارب|تقييم|تقييمات).{0,35}(?:الطلاب|الطلبة|الطالبات|الدكاترة|دكتور|أستاذ|استاذ|مادة|مقرر|التسجيل|النقل|الباص|مطعم|كافيه|الجامعة)",
+    r"(?:الرأي|الراي).{0,20}(?:في|عن).{0,25}(?:التسجيل|الدكاترة|المقررات|المواد|النقل|المطاعم)",
+    r"(?:مين|منو|شنو|وش|ما).{0,15}(?:أفضل|افضل|أحسن|احسن|أسوأ|اسوأ|اسوء|أسهل|اسهل).{0,25}(?:دكتور|أستاذ|استاذ|شعبة).{0,30}",
+    r"(?:مين|منو|شنو|وش|ما).{0,15}(?:أفضل|افضل|أحسن|احسن|أسوأ|اسوأ|اسوء).{0,20}(?:مطعم|كافيه|كافتيريا).{0,25}(?:بالجامعة|في الجامعة|جامعة الكويت|الكلية|الحرم)",
+    r"(?:المصادر الأصلية|المصادر الاصليه|مصادر).{0,25}(?:آراء|اراء|تقييمات).{0,20}(?:الدكاترة|الطلاب|الطلبة)",
+    r"(?:بناء[ً ]?على|حسب).{0,20}(?:تعليقات|آراء|اراء).{0,25}(?:كم طالب|متفق)",
+    r"\b(?:student opinions?|student reviews?|professor reviews?|best professor|worst professor|rate my professor)\b",
+    r"\b(?:best|worst)\s+(?:restaurant|cafe|food)\b.{0,25}\b(?:on campus|at ku|kuwait university)\b",
+)
+
+_MIXED_COURSE_RECOMMENDATION_PATTERNS = (
+    r"(?:انصحني|نصحني|ترشح|اقترح).{0,25}(?:مادة|مقرر|مواد).{0,25}(?:سهل|سهلة|مريح|مريحة|رفع المعدل|النجاح)",
+    r"\b(?:recommend|suggest)\b.{0,25}\b(?:easy|gpa boost|elective)\b.{0,20}\b(?:course|class)\b",
 )
 
 
@@ -167,6 +194,8 @@ _OFFICIAL_PATTERNS = (
     r"(?:منو|من هو|من هي|شنو اسم|وش اسم).{0,20}(?:العميد|الوكيل|رئيس القسم|المدير)",
     r"(?:منو|من هو|من هي|شنو اسم|وش اسم).{0,20}رئيس قسم",
     r"(?:dean|department chair|faculty member|academic staff|administrative staff).{0,35}(?:college|department|kuwait university|university|office)",
+    # Campus bus/shuttle official schedules.
+    r"(?:أوقات|اوقات|مواعيد|جدول).{0,15}(?:الباص|الباصات|النقل|الحافلات)",
 )
 
 _EDUCATIONAL_PATTERNS = (
@@ -231,15 +260,59 @@ def is_general_academic_explanation(question: str) -> bool:
                 and not re.search(r"جامعة الكويت|kuwait university", text))
 
 
-def classify_query(user_message: str) -> QueryIntent:
-    """Classify a request without adding model latency or token cost."""
+def is_current_campus_fact_query(user_message: str) -> bool:
+    """Return True for live operational status queries (e.g. open now) that must not use cached rumors."""
+    text = re.sub(r"[\u064b-\u065f]", "", _normalize(user_message))
+    return _matches_any(_CURRENT_CAMPUS_FACT_PATTERNS, text)
+
+
+def is_community_opinion_query(user_message: str) -> bool:
+    """Return True for subjective student opinions, professor reviews, or campus dining experiences."""
+    text = re.sub(r"[\u064b-\u065f]", "", _normalize(user_message))
+    return _matches_any(_COMMUNITY_OPINION_PATTERNS, text)
+
+
+def is_mixed_course_recommendation_query(user_message: str) -> bool:
+    """Return True when a student asks for easy/recommended courses requiring official + community separation."""
+    text = re.sub(r"[\u064b-\u065f]", "", _normalize(user_message))
+    return _matches_any(_MIXED_COURSE_RECOMMENDATION_PATTERNS, text)
+
+
+def classify_query(user_message: str, *, community_enabled: bool = False) -> QueryIntent:
+    """Classify a request without adding model latency or token cost.
+
+    When `community_enabled` is False (production default), preserves exact
+    baseline routing behavior without introducing Community or campus-hours
+    side effects (M1).
+    """
     text = _normalize(user_message)
     if is_general_academic_explanation(text):
         return QueryIntent.GENERAL_EDUCATIONAL
-    if is_explicit_policy_request(text):
-        return QueryIntent.OFFICIAL_UNIVERSITY
-    if is_user_schedule_query(text):
-        return QueryIntent.PERSONAL_SCHEDULE
+
+    if community_enabled:
+        has_community_opinion = is_community_opinion_query(text)
+        has_official_signal = (
+            is_explicit_policy_request(text)
+            or _matches_any(_OFFICIAL_PATTERNS, text)
+        )
+        if is_current_campus_fact_query(text):
+            return QueryIntent.TIME_SENSITIVE_UNIVERSITY
+        if is_mixed_course_recommendation_query(text):
+            return QueryIntent.MIXED_OFFICIAL_COMMUNITY
+        if has_community_opinion and has_official_signal:
+            return QueryIntent.MIXED_OFFICIAL_COMMUNITY
+        if is_explicit_policy_request(text):
+            return QueryIntent.OFFICIAL_UNIVERSITY
+        if is_user_schedule_query(text):
+            return QueryIntent.PERSONAL_SCHEDULE
+        if has_community_opinion:
+            return QueryIntent.COMMUNITY_OPINION
+    else:
+        if is_explicit_policy_request(text):
+            return QueryIntent.OFFICIAL_UNIVERSITY
+        if is_user_schedule_query(text):
+            return QueryIntent.PERSONAL_SCHEDULE
+
     if text in _CASUAL_EXACT or _matches_any(_CONVERSATIONAL_FOLLOW_UP_PATTERNS, text):
         return QueryIntent.CASUAL_UNIVERSITY
     if is_time_sensitive_query(text):
@@ -256,10 +329,11 @@ def classify_query(user_message: str) -> QueryIntent:
     return QueryIntent.UNCERTAIN
 
 
-def should_use_file_search(user_message: str) -> bool:
+def should_use_file_search(user_message: str, *, community_enabled: bool = False) -> bool:
     """Backward-compatible boolean facade for existing callers."""
-    return classify_query(user_message) in {
+    return classify_query(user_message, community_enabled=community_enabled) in {
         QueryIntent.OFFICIAL_UNIVERSITY,
+        QueryIntent.MIXED_OFFICIAL_COMMUNITY,
         QueryIntent.UNCERTAIN,
     }
 
@@ -272,17 +346,27 @@ _CONTEXTUAL = re.compile(
 _FILE_REFERENCE = re.compile(r"الملف (?:الذي|اللي) (?:رفعته|ارسلته)|(?:my|the) uploaded (?:file|schedule)|(?:the )?file i uploaded")
 
 
-def contextual_query_intent(question: str, prior_messages_desc: list[dict]) -> QueryIntent:
+def contextual_query_intent(
+    question: str,
+    prior_messages_desc: list[dict],
+    *,
+    community_enabled: bool = False,
+) -> QueryIntent:
     """Use a preceding user topic only for a recognizable continuation."""
     text = _normalize(question).translate(str.maketrans("أإآ", "ااا"))
     text = re.sub(r"[\u064b-\u065f]", "", text)
     if _FILE_REFERENCE.search(text):
         return QueryIntent.PERSONAL_SCHEDULE
-    intent = classify_query(question)
-    if intent in {QueryIntent.OFFICIAL_UNIVERSITY, QueryIntent.TIME_SENSITIVE_UNIVERSITY} or not _CONTEXTUAL.search(text):
+    intent = classify_query(question, community_enabled=community_enabled)
+    if intent in {
+        QueryIntent.OFFICIAL_UNIVERSITY,
+        QueryIntent.TIME_SENSITIVE_UNIVERSITY,
+        QueryIntent.COMMUNITY_OPINION,
+        QueryIntent.MIXED_OFFICIAL_COMMUNITY,
+    } or not _CONTEXTUAL.search(text):
         return intent
     previous = next((str(row.get("content", "")) for row in prior_messages_desc if row.get("isUser", True)), "")
-    prior_intent = classify_query(previous)
+    prior_intent = classify_query(previous, community_enabled=community_enabled)
     if prior_intent in {QueryIntent.PERSONAL_SCHEDULE, QueryIntent.GENERAL_EDUCATIONAL}:
         return prior_intent
     return intent

@@ -5,12 +5,14 @@ Service layer for chat orchestration.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import time
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
-from ..prompts import get_system_prompt, get_web_search_prompt
+from ..prompts import get_community_only_prompt, get_system_prompt, get_web_search_prompt
 from .query_router import (
     QueryIntent,
     contextual_query_intent,
@@ -44,12 +46,40 @@ from .provider_usage import UsageTrace, current_usage
 from .verified_answers import arithmetic_match, known_answer, request_clauses
 from .response_policy import has_previous_answer, response_policy_for, response_policy_prompt
 from .model_policy import model_options
+from .community_service import (
+    build_community_prompt_context,
+    community_abstention_answer,
+    community_citations_for_records,
+    community_source_versions_for_records,
+    render_community_section_markdown,
+    retrieve_community_context,
+    verify_records_still_published,
+)
 from ..task_tracker import background_tasks
 from ..logger import chat_id_var, generation_fence_var, uid_var
 
 logger = logging.getLogger(__name__)
 
 PERSISTENCE_TIMEOUT_SECONDS = 3.0
+_TRUSTED_NON_COMMUNITY_PROVENANCE = frozenset({
+    "non_community",
+    "official_university",
+    "general_educational",
+    "personal_schedule",
+    "casual_university",
+})
+
+
+def _is_strict_official_ku_url(url: object) -> bool:
+    """Validate strict https:// origin under ku.edu.kw (rejects ku.edu.kw in path on evil hosts, H6)."""
+    if not isinstance(url, str) or not url.strip():
+        return False
+    try:
+        parsed = urlparse(url.strip())
+        host = (parsed.hostname or "").strip().lower()
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and (host == "ku.edu.kw" or host.endswith(".ku.edu.kw"))
 
 
 async def process_chat(
@@ -138,8 +168,62 @@ async def process_chat(
     # Persist asynchronously after the history snapshot is complete. This keeps
     # the current request out of raw_messages without text-based deduplication,
     # so legitimate repeated questions remain intact.
-    # 2. Build token-limited context (returns chronological list)
-    history = build_history(raw_messages, config.HISTORY_TOKEN_BUDGET)
+    # 2. Build token-limited context (returns chronological list).
+    # H6: Revocation protection for prior Community-derived answers MUST remain active
+    # even when COMMUNITY_RAG_ENABLED=false. When COMMUNITY_RAG_ENABLED=true, also exclude
+    # unknown legacy unannotated assistant history while preserving server-provenanced
+    # non-Community study continuity and strict official-origin citations.
+    community_rag_enabled = bool(getattr(config, "COMMUNITY_RAG_ENABLED", False))
+    safe_raw_messages = raw_messages
+    if raw_messages:
+        filtered_history_rows = []
+        for row in raw_messages:
+            if not isinstance(row, dict) or row.get("isUser", True):
+                filtered_history_rows.append(row)
+                continue
+            row_citations = row.get("citations")
+            community_refs = [
+                {
+                    "community_id": c.get("community_id"),
+                    "approval_version": c.get("approval_version") or 0,
+                }
+                for c in (row_citations if isinstance(row_citations, list) else [])
+                if isinstance(c, dict) and c.get("source_kind") == "community_opinion" and c.get("community_id")
+            ]
+            if community_refs:
+                # Active even when COMMUNITY_RAG_ENABLED=false so disabling new retrieval never revives revoked history!
+                still_valid = await verify_records_still_published(community_refs)
+                if len(still_valid) != len(community_refs):
+                    continue
+                filtered_history_rows.append(row)
+                continue
+
+            if not community_rag_enabled:
+                filtered_history_rows.append(row)
+                continue
+
+            # Server-persisted non-Community provenance preserves ordinary study continuity (H6).
+            server_prov = row.get("serverProvenanceKind") or row.get("history_source_kind")
+            if isinstance(server_prov, str) and server_prov in _TRUSTED_NON_COMMUNITY_PROVENANCE:
+                filtered_history_rows.append(row)
+                continue
+
+            if isinstance(row_citations, list) and len(row_citations) > 0 and all(
+                isinstance(c, dict)
+                and c.get("source_kind") != "community_opinion"
+                and (
+                    (c.get("type") == "file_citation" and isinstance(c.get("file_id"), str) and bool(c["file_id"].strip()))
+                    or (c.get("type") == "url_citation" and _is_strict_official_ku_url(c.get("url")))
+                )
+                for c in row_citations
+            ):
+                filtered_history_rows.append(row)
+                continue
+
+            # Legacy unannotated assistant message -> exclude fail-closed when Community RAG is enabled.
+            continue
+        safe_raw_messages = filtered_history_rows
+    history = build_history(safe_raw_messages, config.HISTORY_TOKEN_BUDGET)
 
     # Convert to OpenAI input format
     history_dicts = [{"role": m.role, "content": m.content} for m in history]
@@ -156,7 +240,7 @@ async def process_chat(
     schedule_college = next(iter(schedule_colleges)) if len(schedule_colleges) == 1 else None
     clauses = request_clauses(message)
     is_mixed = len(clauses) > 1
-    direct_answer = None if is_mixed else known_answer(message, raw_messages)
+    direct_answer = None if is_mixed else known_answer(message, safe_raw_messages)
     calendar_query = None
     verified_parts = []
     remaining = []
@@ -168,8 +252,12 @@ async def process_chat(
             elif is_mixed:
                 remaining.append(clause)
             continue
-        clause_intent = contextual_query_intent(clause, raw_messages)
-        candidate = resolve_calendar_query(clause, [] if is_mixed else raw_messages, schedule_college=schedule_college) if (
+        clause_intent = contextual_query_intent(
+            clause,
+            safe_raw_messages,
+            community_enabled=community_rag_enabled,
+        )
+        candidate = resolve_calendar_query(clause, [] if is_mixed else safe_raw_messages, schedule_college=schedule_college) if (
             clause_intent is not QueryIntent.PERSONAL_SCHEDULE
         ) else None
         if candidate and calendar_query is None:
@@ -177,12 +265,33 @@ async def process_chat(
         else:
             remaining.append(clause)
     remaining_question = " ".join(remaining) if is_mixed else message
-    remaining_intents = {contextual_query_intent(clause, raw_messages) for clause in remaining} if is_mixed else set()
-    intent = contextual_query_intent(remaining_question, raw_messages)
-    for official_intent in (QueryIntent.TIME_SENSITIVE_UNIVERSITY, QueryIntent.OFFICIAL_UNIVERSITY):
-        if official_intent in remaining_intents:
-            intent = official_intent
-            break
+    remaining_intents = (
+        {
+            contextual_query_intent(clause, safe_raw_messages, community_enabled=community_rag_enabled)
+            for clause in remaining
+        }
+        if is_mixed
+        else set()
+    )
+    intent = contextual_query_intent(
+        remaining_question,
+        safe_raw_messages,
+        community_enabled=community_rag_enabled,
+    )
+    has_mixed_official_and_community = community_rag_enabled and (
+        QueryIntent.MIXED_OFFICIAL_COMMUNITY in remaining_intents
+        or (
+            QueryIntent.COMMUNITY_OPINION in remaining_intents
+            and bool(remaining_intents & {QueryIntent.OFFICIAL_UNIVERSITY, QueryIntent.TIME_SENSITIVE_UNIVERSITY})
+        )
+    )
+    if has_mixed_official_and_community:
+        intent = QueryIntent.MIXED_OFFICIAL_COMMUNITY
+    else:
+        for official_intent in (QueryIntent.TIME_SENSITIVE_UNIVERSITY, QueryIntent.OFFICIAL_UNIVERSITY):
+            if official_intent in remaining_intents:
+                intent = official_intent
+                break
     needs_generation = is_mixed and bool(remaining)
 
     # A standalone lesson without attached context can omit schedules. Once
@@ -224,16 +333,34 @@ async def process_chat(
 
     # 4. Current-information requests go straight to the web; static official
     # and uncertain university intent retain the File Search -> web fallback.
+    # H1/H5/H6: Official prompts NEVER receive Community text; Community lookup
+    # runs inside the SSE error boundary below.
+    is_community_only = community_rag_enabled and intent is QueryIntent.COMMUNITY_OPINION
+    is_mixed_community = community_rag_enabled and intent is QueryIntent.MIXED_OFFICIAL_COMMUNITY
+    community_citations: list[dict] = []
+    community_source_versions: list[dict] = []
+
     require_official = (
-        intent is not QueryIntent.PERSONAL_SCHEDULE
+        intent not in {QueryIntent.PERSONAL_SCHEDULE, QueryIntent.COMMUNITY_OPINION}
         and not is_general_academic_explanation(remaining_question)
-        and (needs_authoritative_policy(remaining_question) or is_explicit_policy_request(remaining_question))
+        and (
+            is_mixed_community
+            or needs_authoritative_policy(remaining_question)
+            or is_explicit_policy_request(remaining_question)
+        )
     )
     use_web_search = intent is QueryIntent.TIME_SENSITIVE_UNIVERSITY
-    use_file_search = (require_official and not use_web_search) or intent in {
-        QueryIntent.OFFICIAL_UNIVERSITY,
-        QueryIntent.UNCERTAIN,
-    }
+    use_file_search = (
+        not is_community_only
+        and (
+            (require_official and not use_web_search)
+            or intent in {
+                QueryIntent.OFFICIAL_UNIVERSITY,
+                QueryIntent.MIXED_OFFICIAL_COMMUNITY,
+                QueryIntent.UNCERTAIN,
+            }
+        )
+    )
     tools = []
     if use_file_search:
         tools.append({
@@ -305,6 +432,19 @@ async def process_chat(
                 save_kwargs["generation_fence"] = generation_fence
             if generation_claim is not None:
                 save_kwargs["generation_claim"] = generation_claim
+            # H6: Persist trusted server-generated provenance when supported by repository.
+            try:
+                sig = inspect.signature(save_assistant_message)
+                if "provenance_kind" in sig.parameters:
+                    save_kwargs["provenance_kind"] = (
+                        "community_opinion"
+                        if is_community_only
+                        else "mixed_official_community"
+                        if is_mixed_community
+                        else "non_community"
+                    )
+            except (TypeError, ValueError):
+                pass
             saved = await asyncio.wait_for(
                 save_assistant_message(**save_kwargs),
                 timeout=PERSISTENCE_TIMEOUT_SECONDS,
@@ -416,7 +556,11 @@ async def process_chat(
                     "<verified_application_answer>\n" + local_text + "\n</verified_application_answer>"
                 )
                 academic_calendar_context += "\n\n" + continuation
-                system_prompt = get_system_prompt(system_context, schedule_context, academic_calendar_context)
+                system_prompt = get_system_prompt(
+                    system_context,
+                    schedule_context,
+                    academic_calendar_context,
+                )
                 local_text += "\n\n"
                 local_prefix_length = len(local_text)
             accumulated_text.append(local_text)
@@ -424,6 +568,89 @@ async def process_chat(
 
         if local_texts and not needs_generation:
             done_payload = {"type": "done", "citations": local_citations}
+        elif is_community_only:
+            # H2/H5/H6: Isolated pure-Community path inside SSE error boundary.
+            # Never forwards private history, schedules, or uploaded study context.
+            community_result = await retrieve_community_context(remaining_question)
+            surviving = (
+                await verify_records_still_published(community_result.records)
+                if community_result.records
+                else []
+            )
+            if not surviving:
+                abstention = community_abstention_answer(
+                    message,
+                    english=is_english_message(message),
+                    unavailable=(community_result.status == "unavailable"),
+                )
+                accumulated_text.append(abstention)
+                yield "data: " + json.dumps({"type": "chunk", "content": abstention}) + "\n\n"
+                done_payload = {"type": "done", "citations": []}
+            else:
+                comm_prompt = get_community_only_prompt(build_community_prompt_context(surviving))
+                comm_chunks: list[str] = []
+                comm_done: dict | None = None
+                comm_error: dict | None = None
+                # Pass ONLY the current user message (no private history/schedules/context).
+                async for sse_line in stream_chat(
+                    [{"role": "user", "content": message}],
+                    comm_prompt,
+                    tools=[],
+                ):
+                    if ttft is None and '"type": "chunk"' in sse_line:
+                        ttft = time.perf_counter() - openai_start
+                    payload = parse_sse(sse_line)
+                    if payload is None:
+                        continue
+                    if payload.get("type") == "error":
+                        comm_error = payload
+                        break
+                    if payload.get("type") == "chunk":
+                        comm_chunks.append(payload.get("content", ""))
+                    elif payload.get("type") == "done":
+                        comm_done = payload
+                if comm_error is not None or comm_done is None:
+                    provider_failed = True
+                    yield stream_error(comm_error)
+                    return
+
+                # H2/H4: Authoritative revocation check immediately before emitting/persisting.
+                pre_gen_count = len(surviving)
+                post_surviving = await verify_records_still_published(surviving)
+                if not post_surviving:
+                    abstention = community_abstention_answer(
+                        message,
+                        english=is_english_message(message),
+                    )
+                    accumulated_text.append(abstention)
+                    yield "data: " + json.dumps({"type": "chunk", "content": abstention}) + "\n\n"
+                    done_payload = {"type": "done", "citations": []}
+                else:
+                    # H4: If ANY contributing source was withdrawn during generation, NEVER relabel
+                    # the multi-source LLM text as supported by surviving sources — discard it and
+                    # render fresh deterministic verified surviving excerpts instead.
+                    if len(post_surviving) < pre_gen_count:
+                        comm_text = render_community_section_markdown(
+                            post_surviving,
+                            english=is_english_message(message),
+                        )
+                    else:
+                        comm_text = "".join(comm_chunks).strip()
+                        if not comm_text:
+                            comm_text = render_community_section_markdown(
+                                post_surviving,
+                                english=is_english_message(message),
+                            )
+                    accumulated_text.append(comm_text)
+                    community_citations = community_citations_for_records(post_surviving)
+                    community_source_versions = community_source_versions_for_records(post_surviving)
+                    yield "data: " + json.dumps({
+                        "type": "chunk",
+                        "content": comm_text,
+                        "source_kind": "community_opinion",
+                        "community_source_versions": community_source_versions,
+                    }) + "\n\n"
+                    done_payload = comm_done
         elif use_web_search:
             web_text: list[str] = []
             web_citations: list[dict] = []
@@ -586,6 +813,33 @@ async def process_chat(
                 else:
                     yield sse_line
 
+        # H1/H2/H5: For mixed queries, independently retrieve, verify, and programmatically
+        # append the dated Community section AFTER official generation completes.
+        if is_mixed_community and done_payload is not None:
+            community_result = await retrieve_community_context(remaining_question)
+            surviving = (
+                await verify_records_still_published(community_result.records)
+                if community_result.records
+                else []
+            )
+            comm_section = "\n\n" + render_community_section_markdown(
+                surviving,
+                english=is_english_message(message),
+                unavailable=(community_result.status == "unavailable"),
+            )
+            accumulated_text.append(comm_section)
+            if surviving:
+                community_citations = community_citations_for_records(surviving)
+                community_source_versions = community_source_versions_for_records(surviving)
+                yield "data: " + json.dumps({
+                    "type": "chunk",
+                    "content": comm_section,
+                    "source_kind": "community_opinion",
+                    "community_source_versions": community_source_versions,
+                }) + "\n\n"
+            else:
+                yield "data: " + json.dumps({"type": "chunk", "content": comm_section}) + "\n\n"
+
         if done_payload is None:
             provider_failed = True
             yield stream_error()
@@ -594,7 +848,11 @@ async def process_chat(
         # `done` means both messages have been committed in order (or that a
         # persistence failure was logged).  This makes immediate follow-ups see
         # the complete preceding turn and keeps `done` the final SSE event.
-        if local_citations:
+        if community_citations:
+            add_provider_citations(community_citations)
+        if community_source_versions:
+            done_payload = {**done_payload, "community_source_versions": community_source_versions}
+        if local_citations or community_citations:
             seen = set()
             unique_citations = []
             for citation in accumulated_citations:
