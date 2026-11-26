@@ -29,6 +29,7 @@ from ..community_repository import (
     CommunityIdCollisionError,
     CommunityIngestionInProgressError,
     claim_or_resume_ingestion_job,
+    create_community_record_fenced,
     create_community_record_strict,
     create_evidence_artifact_immutable,
     get_community_record,
@@ -39,6 +40,7 @@ from ..community_repository import (
     save_source_archive_idempotent,
     transition_community_record_atomic,
     update_ingestion_job,
+    update_ingestion_job_fenced,
     verify_record_not_revoked,
 )
 from ..config import get_config
@@ -62,10 +64,13 @@ from .community_models import (
 from .community_policy import (
     APPROVAL_DIGEST_VERSION,
     Decision,
+    compute_canonical_text_fingerprint,
     compute_evidence_snapshot_sha256,
     compute_record_content_hash,
     detect_pii_or_defamation_signals,
+    escape_markdown_text,
     evaluate_for_publication,
+    evidence_supports_candidate_claim,
     filter_retrieved_community,
     is_valid_iso_date,
     is_valid_iso_timestamp,
@@ -495,6 +500,7 @@ async def register_evidence_artifact(
         publication_date=request.publication_date,
         captured_snapshot_text=request.captured_snapshot_text,
     )
+    content_fingerprint = compute_canonical_text_fingerprint(request.captured_snapshot_text)
     evidence_id = f"ev-{computed_sha256[:16]}"
     artifact = EvidenceArtifact(
         evidence_id=evidence_id,
@@ -503,12 +509,15 @@ async def register_evidence_artifact(
         captured_at=request.captured_at.strip(),
         publication_date=request.publication_date.strip(),
         captured_snapshot_text=request.captured_snapshot_text,
+        content_fingerprint=content_fingerprint,
         computed_sha256=computed_sha256,
         captured_by=captured_by,
         created_at=_utc_now_iso(),
         immutable=True,
     )
-    return await create_evidence_artifact_immutable(artifact.model_dump(mode="json"))
+    stored = await create_evidence_artifact_immutable(artifact.model_dump(mode="json"))
+    # C1/M3: Minimize returned artifact payload (do not echo raw potentially sensitive snapshot text).
+    return {k: v for k, v in stored.items() if k != "captured_snapshot_text"}
 
 
 async def ingest_community_upload(
@@ -570,6 +579,8 @@ async def ingest_community_upload(
         return job_state, True
 
     is_resumed = outcome == "resumed"
+    attempt_fence = int(job_state.get("attempt_fence") or 1)
+    initial_job = initial_job.model_copy(update={"attempt_fence": attempt_fence})
 
     # H3/H6: Store only bounded archive metadata pointer in Firestore (never multi-MiB raw body).
     has_pii, _ = detect_pii_or_defamation_signals(raw_text[:512])
@@ -596,8 +607,14 @@ async def ingest_community_upload(
     try:
         for rec in records:
             rec_dict = rec.model_dump(mode="json")
-            saved_rec = await create_community_record_strict(
+            rec_dict["uploaded_by"] = uploaded_by
+            rec_dict["canonical_text_fingerprint"] = compute_canonical_text_fingerprint(
+                f"{rec.topic_ar} {rec.summary_sanitized_ar}"
+            )
+            saved_rec = await create_community_record_fenced(
                 rec_dict,
+                source_sha256=source_sha256,
+                attempt_fence=attempt_fence,
                 allow_same_job_resume=is_resumed,
             )
             record_ids.append(saved_rec["community_id"])
@@ -621,7 +638,15 @@ async def ingest_community_upload(
                 "error": f"{type(exc).__name__}: {exc}",
             }
         )
-        await update_ingestion_job(source_sha256, failed_job.model_dump(mode="json"))
+        try:
+            await update_ingestion_job_fenced(
+                source_sha256,
+                attempt_fence=attempt_fence,
+                job_data=failed_job.model_dump(mode="json"),
+            )
+        except CommunityConcurrencyError:
+            # Stale attempt lost lease ownership; never overwrite newer worker's state.
+            pass
         raise
 
     completed_job = initial_job.model_copy(
@@ -637,7 +662,11 @@ async def ingest_community_upload(
             "updated_at": _utc_now_iso(),
         }
     )
-    saved_job = await update_ingestion_job(source_sha256, completed_job.model_dump(mode="json"))
+    saved_job = await update_ingestion_job_fenced(
+        source_sha256,
+        attempt_fence=attempt_fence,
+        job_data=completed_job.model_dump(mode="json"),
+    )
     return saved_job, False
 
 
@@ -754,10 +783,34 @@ async def apply_review_action(
             pre_reasons.append("EVIDENCE_DIGEST_MISMATCH")
 
         evidence_captured_by = str(artifact.get("captured_by") or "").strip()
+        uploaded_by = str(existing.get("uploaded_by") or "").strip()
         if not evidence_captured_by:
             pre_reasons.append("MISSING_EVIDENCE_VERIFIER")
-        elif evidence_captured_by == reviewer_uid.strip():
-            pre_reasons.append("SELF_ATTESTED_EVIDENCE_FORBIDDEN")
+        else:
+            if evidence_captured_by == reviewer_uid.strip():
+                pre_reasons.append("SELF_ATTESTED_EVIDENCE_FORBIDDEN")
+            if uploaded_by and evidence_captured_by == uploaded_by:
+                pre_reasons.append("UPLOADER_CANNOT_BE_EVIDENCE_VERIFIER")
+        if uploaded_by and uploaded_by == reviewer_uid.strip():
+            pre_reasons.append("UPLOADER_CANNOT_SELF_APPROVE")
+
+        # C1: Compare canonical content fingerprints to detect reused upload text,
+        # AND check that the captured snapshot actually supports the candidate claim.
+        ev_text = str(artifact.get("captured_snapshot_text") or "")
+        ev_fingerprint = str(artifact.get("content_fingerprint") or compute_canonical_text_fingerprint(ev_text))
+        cand_fingerprint = str(
+            existing.get("canonical_text_fingerprint")
+            or compute_canonical_text_fingerprint(f"{merged.get('topic_ar', '')} {merged.get('summary_sanitized_ar', '')}")
+        )
+        summary_only_fp = compute_canonical_text_fingerprint(str(merged.get("summary_sanitized_ar") or ""))
+        if ev_fingerprint in {cand_fingerprint, summary_only_fp}:
+            pre_reasons.append("EVIDENCE_REUSES_UPLOAD_CONTENT")
+        if not evidence_supports_candidate_claim(
+            ev_text,
+            str(merged.get("topic_ar") or ""),
+            str(merged.get("summary_sanitized_ar") or ""),
+        ):
+            pre_reasons.append("EVIDENCE_CLAIM_APPLICABILITY_FAILED")
 
         if existing.get("source_sha256") and recomputed_sha == existing.get("source_sha256"):
             pre_reasons.append("EVIDENCE_NOT_INDEPENDENT_OF_UPLOAD")
@@ -787,10 +840,7 @@ async def apply_review_action(
         merged["approval_version"] = next_approval_version
         merged["evidence_id"] = request.evidence_id.strip()
         merged["evidence_hash"] = recomputed_sha
-
-        # Full v2 canonical approval digest over ALL gate-driving fields + evidence IDs.
-        content_hash = compute_record_content_hash(merged)
-        merged["approved_content_hash"] = content_hash
+        merged["canonical_text_fingerprint"] = cand_fingerprint
 
         person_mentioned = merged.get("identifiable_person_mentioned") is True
         rep_decision = (
@@ -798,22 +848,30 @@ async def apply_review_action(
             else "FAIL" if person_mentioned
             else "NOT_APPLICABLE"
         )
+        # H5: Build attestation fields first, then compute v3 digest binding BOTH record and attestation fields!
+        att_seed = {
+            "digest_version": APPROVAL_DIGEST_VERSION,
+            "attestation_version": next_approval_version,
+            "evidence_id": request.evidence_id.strip(),
+            "evidence_hash": recomputed_sha,
+            "evidence_content_fingerprint": ev_fingerprint,
+            "evidence_captured_by": evidence_captured_by,
+            "canonical_source_url": art_url,
+            "captured_publisher": art_pub,
+            "captured_at": art_captured_at,
+            "publication_date": art_date,
+            "reviewer_id": reviewer_uid,
+            "reviewed_at": now_iso,
+            "privacy_decision": "PASS" if merged.get("privacy_review_status") == "PASS" else "FAIL",
+            "rights_decision": "PASS" if merged.get("rights_review_status") == "PASS" else "FAIL",
+            "reputational_decision": rep_decision,
+        }
+        content_hash = compute_record_content_hash(merged, attestation=att_seed)
+        merged["approved_content_hash"] = content_hash
+
         attestation = ApprovalAttestation(
-            digest_version=APPROVAL_DIGEST_VERSION,
-            attestation_version=next_approval_version,
             approved_content_hash=content_hash,
-            evidence_id=request.evidence_id.strip(),
-            evidence_hash=recomputed_sha,
-            evidence_captured_by=evidence_captured_by,
-            canonical_source_url=art_url,
-            captured_publisher=art_pub,
-            captured_at=art_captured_at,
-            publication_date=art_date,
-            reviewer_id=reviewer_uid,
-            reviewed_at=now_iso,
-            privacy_decision="PASS" if merged.get("privacy_review_status") == "PASS" else "FAIL",
-            rights_decision="PASS" if merged.get("rights_review_status") == "PASS" else "FAIL",
-            reputational_decision=rep_decision,
+            **att_seed,
         )
         merged["approval_attestation"] = attestation.model_dump(mode="json")
 
@@ -1024,8 +1082,8 @@ def render_community_section_markdown(
             )
         lines = [header, "", f"*{FIXED_SEPARATION_DISCLAIMER_EN}*", ""]
         for rec in records:
-            topic = sanitize_community_text(str(rec.get("topic_ar") or "Student review"), max_length=160)
-            summary = sanitize_community_text(str(rec.get("summary_sanitized_ar") or ""), max_length=400)
+            topic = escape_markdown_text(str(rec.get("topic_ar") or "Student review"), max_length=160)
+            summary = escape_markdown_text(str(rec.get("summary_sanitized_ar") or ""), max_length=400)
             url = str(rec.get("original_source_link") or "").strip()
             pub_date = str(rec.get("publication_date") or "").strip()
             lines.append(f"- **{topic}** ({pub_date}): {summary} — [Original post]({url})")
@@ -1044,8 +1102,8 @@ def render_community_section_markdown(
         )
     lines = [header, "", f"*{FIXED_SEPARATION_DISCLAIMER_AR}*", ""]
     for rec in records:
-        topic = sanitize_community_text(str(rec.get("topic_ar") or "رأي طلابي"), max_length=160)
-        summary = sanitize_community_text(str(rec.get("summary_sanitized_ar") or ""), max_length=400)
+        topic = escape_markdown_text(str(rec.get("topic_ar") or "رأي طلابي"), max_length=160)
+        summary = escape_markdown_text(str(rec.get("summary_sanitized_ar") or ""), max_length=400)
         url = str(rec.get("original_source_link") or "").strip()
         pub_date = str(rec.get("publication_date") or "").strip()
         lines.append(f"- **{topic}** ({pub_date}): {summary} — [المصدر الأصلي]({url})")

@@ -5,10 +5,12 @@ Service layer for chat orchestration.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import time
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
 from ..prompts import get_community_only_prompt, get_system_prompt, get_web_search_prompt
 from .query_router import (
@@ -59,6 +61,25 @@ from ..logger import chat_id_var, generation_fence_var, uid_var
 logger = logging.getLogger(__name__)
 
 PERSISTENCE_TIMEOUT_SECONDS = 3.0
+_TRUSTED_NON_COMMUNITY_PROVENANCE = frozenset({
+    "non_community",
+    "official_university",
+    "general_educational",
+    "personal_schedule",
+    "casual_university",
+})
+
+
+def _is_strict_official_ku_url(url: object) -> bool:
+    """Validate strict https:// origin under ku.edu.kw (rejects ku.edu.kw in path on evil hosts, H6)."""
+    if not isinstance(url, str) or not url.strip():
+        return False
+    try:
+        parsed = urlparse(url.strip())
+        host = (parsed.hostname or "").strip().lower()
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and (host == "ku.edu.kw" or host.endswith(".ku.edu.kw"))
 
 
 async def process_chat(
@@ -148,14 +169,13 @@ async def process_chat(
     # the current request out of raw_messages without text-based deduplication,
     # so legitimate repeated questions remain intact.
     # 2. Build token-limited context (returns chronological list).
-    # H6 / COMM-004 Finding 2: When COMMUNITY_RAG_ENABLED=true, fail closed on:
-    # (a) annotated Community assistant messages whose cited record was later retracted, AND
-    # (b) legacy unannotated assistant messages lacking explicit non-Community provenance,
-    #     so unannotated historical Community answers cannot re-enter future prompts.
-    # When COMMUNITY_RAG_ENABLED=false, preserve exact legacy baseline history behavior.
+    # H6: Revocation protection for prior Community-derived answers MUST remain active
+    # even when COMMUNITY_RAG_ENABLED=false. When COMMUNITY_RAG_ENABLED=true, also exclude
+    # unknown legacy unannotated assistant history while preserving server-provenanced
+    # non-Community study continuity and strict official-origin citations.
     community_rag_enabled = bool(getattr(config, "COMMUNITY_RAG_ENABLED", False))
     safe_raw_messages = raw_messages
-    if community_rag_enabled and raw_messages:
+    if raw_messages:
         filtered_history_rows = []
         for row in raw_messages:
             if not isinstance(row, dict) or row.get("isUser", True):
@@ -171,22 +191,29 @@ async def process_chat(
                 if isinstance(c, dict) and c.get("source_kind") == "community_opinion" and c.get("community_id")
             ]
             if community_refs:
+                # Active even when COMMUNITY_RAG_ENABLED=false so disabling new retrieval never revives revoked history!
                 still_valid = await verify_records_still_published(community_refs)
                 if len(still_valid) != len(community_refs):
                     continue
                 filtered_history_rows.append(row)
                 continue
 
-            # Explicit non-Community provenance (typed flag or verified official-only citations).
-            if row.get("history_source_kind") == "non_community":
+            if not community_rag_enabled:
                 filtered_history_rows.append(row)
                 continue
+
+            # Server-persisted non-Community provenance preserves ordinary study continuity (H6).
+            server_prov = row.get("serverProvenanceKind") or row.get("history_source_kind")
+            if isinstance(server_prov, str) and server_prov in _TRUSTED_NON_COMMUNITY_PROVENANCE:
+                filtered_history_rows.append(row)
+                continue
+
             if isinstance(row_citations, list) and len(row_citations) > 0 and all(
                 isinstance(c, dict)
                 and c.get("source_kind") != "community_opinion"
                 and (
-                    c.get("type") == "file_citation"
-                    or (c.get("type") == "url_citation" and "ku.edu.kw" in str(c.get("url") or "").casefold())
+                    (c.get("type") == "file_citation" and isinstance(c.get("file_id"), str) and bool(c["file_id"].strip()))
+                    or (c.get("type") == "url_citation" and _is_strict_official_ku_url(c.get("url")))
                 )
                 for c in row_citations
             ):
@@ -213,7 +240,7 @@ async def process_chat(
     schedule_college = next(iter(schedule_colleges)) if len(schedule_colleges) == 1 else None
     clauses = request_clauses(message)
     is_mixed = len(clauses) > 1
-    direct_answer = None if is_mixed else known_answer(message, raw_messages)
+    direct_answer = None if is_mixed else known_answer(message, safe_raw_messages)
     calendar_query = None
     verified_parts = []
     remaining = []
@@ -405,6 +432,19 @@ async def process_chat(
                 save_kwargs["generation_fence"] = generation_fence
             if generation_claim is not None:
                 save_kwargs["generation_claim"] = generation_claim
+            # H6: Persist trusted server-generated provenance when supported by repository.
+            try:
+                sig = inspect.signature(save_assistant_message)
+                if "provenance_kind" in sig.parameters:
+                    save_kwargs["provenance_kind"] = (
+                        "community_opinion"
+                        if is_community_only
+                        else "mixed_official_community"
+                        if is_mixed_community
+                        else "non_community"
+                    )
+            except (TypeError, ValueError):
+                pass
             saved = await asyncio.wait_for(
                 save_assistant_message(**save_kwargs),
                 timeout=PERSISTENCE_TIMEOUT_SECONDS,
@@ -574,9 +614,10 @@ async def process_chat(
                     yield stream_error(comm_error)
                     return
 
-                # H2: Authoritative revocation check immediately before emitting/persisting.
-                surviving = await verify_records_still_published(surviving)
-                if not surviving:
+                # H2/H4: Authoritative revocation check immediately before emitting/persisting.
+                pre_gen_count = len(surviving)
+                post_surviving = await verify_records_still_published(surviving)
+                if not post_surviving:
                     abstention = community_abstention_answer(
                         message,
                         english=is_english_message(message),
@@ -585,17 +626,24 @@ async def process_chat(
                     yield "data: " + json.dumps({"type": "chunk", "content": abstention}) + "\n\n"
                     done_payload = {"type": "done", "citations": []}
                 else:
-                    comm_text = "".join(comm_chunks).strip()
-                    # H5: Validate nonempty content before attaching citations and ending in done.
-                    if not comm_text:
+                    # H4: If ANY contributing source was withdrawn during generation, NEVER relabel
+                    # the multi-source LLM text as supported by surviving sources — discard it and
+                    # render fresh deterministic verified surviving excerpts instead.
+                    if len(post_surviving) < pre_gen_count:
                         comm_text = render_community_section_markdown(
-                            surviving,
+                            post_surviving,
                             english=is_english_message(message),
                         )
+                    else:
+                        comm_text = "".join(comm_chunks).strip()
+                        if not comm_text:
+                            comm_text = render_community_section_markdown(
+                                post_surviving,
+                                english=is_english_message(message),
+                            )
                     accumulated_text.append(comm_text)
-                    community_citations = community_citations_for_records(surviving)
-                    community_source_versions = community_source_versions_for_records(surviving)
-                    # COMM-004 Finding 1: Bind source versions to the chunk BEFORE emission/buffering.
+                    community_citations = community_citations_for_records(post_surviving)
+                    community_source_versions = community_source_versions_for_records(post_surviving)
                     yield "data: " + json.dumps({
                         "type": "chunk",
                         "content": comm_text,

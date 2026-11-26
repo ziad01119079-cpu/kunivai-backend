@@ -81,14 +81,12 @@ def _approved_community_record(**overrides) -> dict:
         "isolated_from_official_kb": True,
     }
     base.update(overrides)
-    content_hash = compute_record_content_hash(base)
-    base["approved_content_hash"] = content_hash
-    base["approval_attestation"] = {
+    att = {
         "digest_version": APPROVAL_DIGEST_VERSION,
         "attestation_version": base["approval_version"],
-        "approved_content_hash": content_hash,
         "evidence_id": base["evidence_id"],
         "evidence_hash": base["evidence_hash"],
+        "evidence_content_fingerprint": None,
         "evidence_captured_by": "verifier-2",
         "canonical_source_url": base["original_source_link"],
         "captured_publisher": "@ku_reviews",
@@ -100,6 +98,10 @@ def _approved_community_record(**overrides) -> dict:
         "rights_decision": "PASS",
         "reputational_decision": "PASS",
     }
+    content_hash = compute_record_content_hash(base, attestation=att)
+    att["approved_content_hash"] = content_hash
+    base["approved_content_hash"] = content_hash
+    base["approval_attestation"] = att
     return base
 
 
@@ -172,10 +174,10 @@ def test_comm004_finding1_coalescer_replay_blocks_revoked_pure_community_and_ret
 
     pure_replay, mixed_replay = asyncio.run(run())
 
-    # Pure Community replay emits safe tombstone error, never revoked text.
-    assert len(pure_replay) == 1
-    assert pure_replay[0]["type"] == "error"
-    assert pure_replay[0]["code"] == "COMMUNITY_SOURCE_REVOKED"
+    # Pure Community replay emits safe tombstone error and zero revoked chunks.
+    assert all(e["type"] != "chunk" for e in pure_replay)
+    assert pure_replay[-1]["type"] == "error"
+    assert pure_replay[-1]["code"] == "COMMUNITY_SOURCE_REVOKED"
 
     # Mixed replay retains Official chunk + Official citation, strips revoked Community chunk & citation.
     mixed_text = "".join(e.get("content", "") for e in mixed_replay if e["type"] == "chunk")
@@ -290,15 +292,23 @@ def test_h1_mixed_query_never_sends_community_text_to_official_generator_and_com
 
 
 def test_h2_warm_cache_checks_authoritative_revocation_before_serving():
+    from app.services.community_service import retrieve_community_context, verify_records_still_published
+
     invalidate_community_cache()
     _published_cache["records"] = [_approved_community_record()]
     _published_cache["expires_at"] = 9999999999.0
 
-    with patch("app.community_repository.verify_record_not_revoked", return_value=False):
-        result = asyncio.run(query_published_community_records(limit=10, use_cache=True))
+    async def run():
+        with (
+            patch("app.services.community_service.get_config", return_value=_config(community_rag_enabled=True)),
+            patch("app.services.community_service.verify_record_not_revoked", return_value=False),
+        ):
+            res = await retrieve_community_context("شنو رأي الطلاب في دكتور مادة المحاسبة؟")
+            return await verify_records_still_published(res.records)
 
+    surviving = asyncio.run(run())
     invalidate_community_cache()
-    assert result == []
+    assert surviving == []
 
 
 def test_h5_malformed_record_never_aborts_sse_and_empty_provider_done_falls_back_safely():

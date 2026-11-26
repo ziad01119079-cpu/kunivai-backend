@@ -21,7 +21,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 
-from ..auth import verify_admin
+from ..auth import verify_admin, verify_community_evidence_verifier
 from ..community_repository import (
     CommunityConcurrencyError,
     CommunityIdCollisionError,
@@ -73,6 +73,7 @@ MAX_COMMUNITY_FILE_SIZE = 256 * 1024
 # M3: UID-scoped write rate limit + bounded concurrency for admin community writes.
 _ADMIN_WRITE_WINDOW_SECONDS = 60.0
 _ADMIN_WRITE_MAX_REQUESTS = 30
+_ADMIN_WRITE_MAX_TRACKED_UIDS = 1000
 _admin_write_windows: dict[str, deque[float]] = {}
 _admin_upload_semaphore = asyncio.Semaphore(4)
 
@@ -84,8 +85,15 @@ def reset_admin_community_rate_limits() -> None:
 
 def _enforce_admin_write_rate_limit(uid: str) -> None:
     now = time.monotonic()
-    bucket = _admin_write_windows.setdefault(uid, deque())
     cutoff = now - _ADMIN_WRITE_WINDOW_SECONDS
+    # M1: Bound UID tracking map to avoid unbounded memory growth.
+    if len(_admin_write_windows) >= _ADMIN_WRITE_MAX_TRACKED_UIDS and uid not in _admin_write_windows:
+        stale = [k for k, q in _admin_write_windows.items() if not q or q[-1] < cutoff]
+        for k in stale:
+            _admin_write_windows.pop(k, None)
+        while len(_admin_write_windows) >= _ADMIN_WRITE_MAX_TRACKED_UIDS:
+            _admin_write_windows.pop(next(iter(_admin_write_windows)))
+    bucket = _admin_write_windows.setdefault(uid, deque())
     while bucket and bucket[0] < cutoff:
         bucket.popleft()
     if len(bucket) >= _ADMIN_WRITE_MAX_REQUESTS:
@@ -143,9 +151,9 @@ def _validate_upload_mime_and_signature(ext: str, content_type: str | None, raw_
 @router.post("/evidence", status_code=status.HTTP_201_CREATED)
 async def create_community_evidence(
     body: EvidenceArtifactCreateRequest,
-    uid: str = Depends(verify_admin),
+    uid: str = Depends(verify_community_evidence_verifier),
 ):
-    """Register an immutable independently captured evidence artifact with server-computed SHA-256."""
+    """Register an immutable independently captured evidence artifact (dedicated verifier role only, C1)."""
     _require_community_ingestion_enabled()
     _enforce_admin_write_rate_limit(uid)
     try:
@@ -279,10 +287,11 @@ async def review_community_record(
     uid: str = Depends(verify_admin),
 ):
     """Approve, reject, or retract a community record (retraction always remains available)."""
-    # M3: Retraction works even when COMMUNITY_INGESTION_ENABLED=false.
+    # M1/M3: Emergency retraction remains available even when ingestion is disabled
+    # and is exempt from the general 30/min admin write rate limiter.
     if body.action != "retract":
         _require_community_ingestion_enabled()
-    _enforce_admin_write_rate_limit(uid)
+        _enforce_admin_write_rate_limit(uid)
 
     try:
         updated = await apply_review_action(

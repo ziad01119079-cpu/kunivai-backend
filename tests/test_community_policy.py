@@ -60,16 +60,14 @@ def _approved_record(**overrides) -> dict:
         "summary_sanitized_ar": "تجربة طلابية عامة لمتابعة الشواغر.",
     }
     base.update(overrides)
-    if "approved_content_hash" not in overrides:
-        base["approved_content_hash"] = compute_record_content_hash(base)
     if "approval_attestation" not in overrides:
         person = base.get("identifiable_person_mentioned") is True
-        base["approval_attestation"] = {
+        att = {
             "digest_version": APPROVAL_DIGEST_VERSION,
             "attestation_version": base.get("approval_version", 1),
-            "approved_content_hash": base["approved_content_hash"],
             "evidence_id": base.get("evidence_id"),
             "evidence_hash": base.get("evidence_hash"),
+            "evidence_content_fingerprint": None,
             "evidence_captured_by": "verifier-2",
             "canonical_source_url": base.get("original_source_link"),
             "captured_publisher": "@ku_students",
@@ -81,6 +79,13 @@ def _approved_record(**overrides) -> dict:
             "rights_decision": "PASS",
             "reputational_decision": "PASS" if (person and base.get("reputational_review_status") == "PASS") else "NOT_APPLICABLE",
         }
+        digest = compute_record_content_hash(base, attestation=att)
+        att["approved_content_hash"] = digest
+        base["approval_attestation"] = att
+        if "approved_content_hash" not in overrides:
+            base["approved_content_hash"] = digest
+    elif "approved_content_hash" not in overrides:
+        base["approved_content_hash"] = compute_record_content_hash(base)
     return base
 
 

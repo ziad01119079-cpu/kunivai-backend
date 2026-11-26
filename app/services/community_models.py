@@ -87,6 +87,7 @@ class EvidenceArtifact(BaseModel):
     captured_at: str
     publication_date: str
     captured_snapshot_text: str
+    content_fingerprint: str
     computed_sha256: str
     captured_by: str
     created_at: str
@@ -94,13 +95,14 @@ class EvidenceArtifact(BaseModel):
 
 
 class ApprovalAttestation(BaseModel):
-    """Server-managed, version-bound approval record tied to full approval digest and evidence artifact."""
+    """Server-managed, version-bound approval record tied to full v3 approval digest and evidence artifact."""
 
-    digest_version: Literal["v2"] = "v2"
+    digest_version: Literal["v3"] = "v3"
     attestation_version: int = Field(ge=1)
     approved_content_hash: str
     evidence_id: str
     evidence_hash: str
+    evidence_content_fingerprint: str | None = None
     evidence_captured_by: str
     canonical_source_url: str
     captured_publisher: str
@@ -150,6 +152,8 @@ class CommunityRecord(BaseModel):
     source_archive_path: str | None = None
     source_vs_file_id: str | None = None
     source_sha256: str | None = None
+    uploaded_by: str | None = None
+    canonical_text_fingerprint: str | None = None
     imported_to_vector_store: bool = False
     valid_until: str | None = None
     source_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -181,6 +185,7 @@ class CommunityIngestionJob(BaseModel):
     source_sha256: str
     filename: str
     status: str = IngestionJobStatus.CLAIMED.value
+    attempt_fence: int = Field(default=1, ge=1)
     attempt_id: str | None = None
     lease_expires_at: float | None = None
     expected_record_ids: list[str] = Field(default_factory=list)

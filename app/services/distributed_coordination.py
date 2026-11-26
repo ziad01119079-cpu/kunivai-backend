@@ -16,8 +16,9 @@ import logging
 from redis.exceptions import RedisError
 
 from .community_replay_guard import (
-    REPLAY_REVOKED_NOTICE_AR,
+    _split_sse_event,
     community_revoked_replay_error,
+    extract_community_refs_from_payload,
     filter_sse_event_for_replay,
 )
 
@@ -309,6 +310,10 @@ class RedisCoordinator:
             state = await self.redis.hgetall(meta)
             status = state.get(b"status", state.get("status"))
             first_id = state.get(b"first_id", state.get("first_id"))
+            # H3: Read persisted section state so mid-stream resume after official chunk preserves mixed terminal.
+            persisted_official = state.get(b"has_official_chunk", state.get("has_official_chunk"))
+            if persisted_official in (b"1", "1"):
+                had_non_community_chunk = True
             checkpoint = (first_id.decode() if isinstance(first_id, bytes) else first_id) if cursor == "0-0" else cursor
             if checkpoint and not await self.redis.xrange(events, min=checkpoint, max=checkpoint, count=1):
                 yield self._error("SSE_REPLAY_UNAVAILABLE", "لم يعد سجل البث كاملاً.", retryable=False)
@@ -329,17 +334,20 @@ class RedisCoordinator:
                     cursor = event_id.decode() if isinstance(event_id, bytes) else event_id
                     raw = fields.get(b"event", fields.get("event"))
                     event = raw.decode() if isinstance(raw, bytes) else raw
-                    filtered_event, revoked, is_official_chunk = await filter_sse_event_for_replay(event)
+                    try:
+                        filtered_event, revoked, is_official_chunk = await filter_sse_event_for_replay(event)
+                    except Exception:
+                        yield f"id: {cursor}\n{community_revoked_replay_error()}"
+                        return
                     if is_official_chunk:
                         had_non_community_chunk = True
                     if revoked:
                         any_community_revoked = True
                     if filtered_event is None:
                         continue
+                    # H3: Emit ONE atomic redacted terminal event using the unique stream cursor ID.
                     if any_community_revoked and self._terminal(filtered_event):
                         if had_non_community_chunk:
-                            notice = "data: " + json.dumps({"type": "chunk", "content": REPLAY_REVOKED_NOTICE_AR}, ensure_ascii=False) + "\n\n"
-                            yield f"id: {cursor}\n{notice}"
                             yield f"id: {cursor}\n{filtered_event}"
                             return
                         yield f"id: {cursor}\n{community_revoked_replay_error()}"
@@ -369,8 +377,14 @@ class RedisCoordinator:
         token = generation_fence_var.set(fence)
         renewer = asyncio.create_task(self._renew_loop(request_key, fence, asyncio.current_task()))
         try:
+            meta, _, _ = self._keys(request_key)
             async with aclosing(factory()) as stream:
                 async for event in stream:
+                    _, parsed = _split_sse_event(event)
+                    if parsed and parsed.get("type") == "chunk":
+                        is_comm, _, _ = extract_community_refs_from_payload(parsed)
+                        if not is_comm:
+                            await self.redis.hset(meta, "has_official_chunk", "1")
                     if not await self._publish(request_key, fence, event) or self._terminal(event):
                         return
             await self._publish(request_key, fence, self._error(

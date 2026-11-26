@@ -1,15 +1,16 @@
-"""Fail-closed publication and post-retrieval gate for Community Knowledge.
+"""Fail-closed publication and post-retrieval gate for Community Knowledge (C1, H5, M2, COMM-006).
 
-Enforces the Kuniv AI Community Knowledge contract (C1, H2, H5, M2, COMM-004):
+Enforces:
 - Strict type validation (no string-valued booleans, no non-string enums, no crash on malformed URLs).
 - Canonical public https:// post URLs only (rejects example/reserved domains, bare homepages, local/private hosts).
 - Strict ISO publication date (YYYY-MM-DD) rejecting future dates.
 - Strict ISO-8601 UTC timestamp validation for reviewer signoff and capture timestamps.
-- Canonical v2 approval digest binding EVERY gate-driving metadata, provenance,
-  compliance, isolation, reviewer, source/archive, and immutable evidence field.
-- Independent `approval_attestation` with `digest_version == "v2"`, `evidence_id`,
-  and `evidence_captured_by` distinct from `reviewer_id`.
-- Re-scans topic, summary, and URL for PII and defamation signals on EVERY gate evaluation.
+- Canonical v3 approval digest binding EVERY gate-driving record field AND attestation-only
+  metadata (`captured_publisher`, `captured_at`, `evidence_captured_by`, `evidence_content_fingerprint`,
+  `uploaded_by`, exact `reviewed_at == moderation_reviewed_at`).
+- Canonical text fingerprinting (`compute_canonical_text_fingerprint`) and claim-span applicability
+  (`evidence_supports_candidate_claim`) so reused upload text and unrelated snapshots fail closed.
+- Markdown escaping (`escape_markdown_text`) preventing untrusted text from injecting external links (M2).
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from ipaddress import ip_address
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
-APPROVAL_DIGEST_VERSION = "v2"
+APPROVAL_DIGEST_VERSION = "v3"
 
 ALLOWED_CONTENT_NATURES = frozenset({
     "PERSONAL_OPINION",
@@ -49,6 +50,12 @@ RESERVED_TEST_DOMAINS = frozenset({
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_ARABIC_NORM = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ة": "ه", "ى": "ي", "ؤ": "و", "ئ": "ي"})
+_CLAIM_STOP_WORDS = frozenset({
+    "في", "من", "على", "عن", "الى", "هل", "ما", "شنو", "وش", "اللي", "الذي", "التي",
+    "مع", "او", "هذا", "هذه", "تجربه", "راي", "طلابي", "طلابيه", "عامه", "الطلاب", "الطلبه",
+    "the", "is", "are", "and", "for", "with", "that", "this", "from", "about",
+})
 
 # PII & defamation heuristics used during ingestion AND re-checked at publication/retrieval.
 _KUWAIT_PHONE_RE = re.compile(r"(?<!\d)(?:\+?965[\s-]?)?[569]\d{7}(?!\d)")
@@ -60,8 +67,6 @@ _SENSITIVE_DEFAMATION_PATTERNS = (
     r"(?:worst professor|terrible professor|corrupt|unfair|avoid at all costs|impossible to pass)",
 )
 
-# Canonical v2 allowlist of EVERY gate-driving field bound into the approval digest.
-# Deliberately excludes `approved_content_hash` and `approval_attestation` to avoid circularity.
 APPROVAL_DIGEST_FIELDS: tuple[str, ...] = (
     "community_id",
     "dedup_group_id",
@@ -86,9 +91,29 @@ APPROVAL_DIGEST_FIELDS: tuple[str, ...] = (
     "moderation_reviewed_at",
     "source_sha256",
     "source_archive_path",
+    "uploaded_by",
+    "canonical_text_fingerprint",
     "approval_version",
     "evidence_id",
     "evidence_hash",
+)
+
+ATTESTATION_DIGEST_FIELDS: tuple[str, ...] = (
+    "digest_version",
+    "attestation_version",
+    "evidence_id",
+    "evidence_hash",
+    "evidence_content_fingerprint",
+    "evidence_captured_by",
+    "canonical_source_url",
+    "captured_publisher",
+    "captured_at",
+    "publication_date",
+    "reviewer_id",
+    "reviewed_at",
+    "privacy_decision",
+    "rights_decision",
+    "reputational_decision",
 )
 
 
@@ -96,6 +121,35 @@ APPROVAL_DIGEST_FIELDS: tuple[str, ...] = (
 class Decision:
     allowed: bool
     reasons: list[str]
+
+
+def _canonicalize_for_fingerprint(text: str) -> str:
+    norm = re.sub(r"[\u064b-\u065f]", "", (text or "").casefold()).translate(_ARABIC_NORM)
+    norm = re.sub(r"[؟،؛!?,.:;()\[\]\"'«»\-_/\\]+", " ", norm)
+    norm = re.sub(r"[^\w\s]+", " ", norm)
+    return " ".join(norm.split())
+
+
+def compute_canonical_text_fingerprint(text: str) -> str:
+    """Canonical SHA-256 fingerprint over normalized text to detect reused upload content (C1)."""
+    return hashlib.sha256(_canonicalize_for_fingerprint(text).encode("utf-8")).hexdigest()
+
+
+def evidence_supports_candidate_claim(evidence_text: str, topic_ar: str, summary_ar: str) -> bool:
+    """Check whether captured evidence text shares meaningful claim tokens with the candidate (C1)."""
+    ev_tokens = {
+        t for t in _canonicalize_for_fingerprint(evidence_text).split()
+        if len(t) >= 3 and t not in _CLAIM_STOP_WORDS
+    }
+    cand_tokens = {
+        t for t in _canonicalize_for_fingerprint(f"{topic_ar} {summary_ar}").split()
+        if len(t) >= 3 and t not in _CLAIM_STOP_WORDS
+    }
+    if not ev_tokens or not cand_tokens:
+        return False
+    overlap = ev_tokens & cand_tokens
+    required = 1 if len(cand_tokens) <= 2 else 2
+    return len(overlap) >= required
 
 
 def compute_evidence_snapshot_sha256(
@@ -118,16 +172,25 @@ def compute_evidence_snapshot_sha256(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def compute_record_content_hash(record: dict[str, Any]) -> str:
-    """Canonical versioned (v2) approval digest binding EVERY gate-driving metadata & evidence field."""
+def compute_record_content_hash(
+    record: dict[str, Any],
+    *,
+    attestation: dict[str, Any] | None = None,
+) -> str:
+    """Canonical versioned (v3) approval digest binding EVERY record field AND attestation-only metadata (H5)."""
     payload: dict[str, Any] = {"digest_version": APPROVAL_DIGEST_VERSION}
     for field in APPROVAL_DIGEST_FIELDS:
         val = record.get(field)
-        # Preserve exact JSON types (bool vs str vs int vs float vs None) so type tampering alters the digest.
-        if isinstance(val, (str, int, float, bool)) or val is None:
-            payload[field] = val
-        else:
-            payload[field] = str(val)
+        payload[field] = val if (isinstance(val, (str, int, float, bool)) or val is None) else str(val)
+
+    att = attestation if attestation is not None else record.get("approval_attestation")
+    att_payload: dict[str, Any] = {}
+    if isinstance(att, dict):
+        for field in ATTESTATION_DIGEST_FIELDS:
+            val = att.get(field)
+            att_payload[field] = val if (isinstance(val, (str, int, float, bool)) or val is None) else str(val)
+    payload["attestation"] = att_payload
+
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -260,7 +323,6 @@ def evaluate_for_publication(
     if mod_status != "APPROVED_FOR_COMMUNITY_PUBLICATION":
         reasons.append(f"MODERATION_NOT_APPROVED:{mod_status}")
 
-    # Strict boolean checks: string-valued "false"/"true" must fail closed (C1).
     sens_flag = record.get("defamation_or_sensitivity_flag")
     if type(sens_flag) is not bool:
         reasons.append("INVALID_SENSITIVITY_FLAG_TYPE")
@@ -313,7 +375,6 @@ def evaluate_for_publication(
     if is_expired(record.get("valid_until"), today=today):
         reasons.append("EXPIRED_RECORD")
 
-    # Re-scan topic, summary, and URL for PII / defamation signals even if flags claim clean (C1).
     combined_text = " ".join(
         str(record.get(k) or "") for k in ("topic_ar", "summary_sanitized_ar", "original_source_link")
     )
@@ -321,7 +382,6 @@ def evaluate_for_publication(
     if has_pii_or_defam:
         reasons.append("CONTENT_PII_OR_SENSITIVE_DETECTED:" + ",".join(signals))
 
-    # Version-bound independent approval attestation & full v2 digest check (C1 / COMM-004).
     attestation = record.get("approval_attestation")
     if not isinstance(attestation, dict):
         reasons.append("MISSING_APPROVAL_ATTESTATION")
@@ -329,7 +389,7 @@ def evaluate_for_publication(
         if attestation.get("digest_version") != APPROVAL_DIGEST_VERSION:
             reasons.append("UNSUPPORTED_ATTESTATION_DIGEST_VERSION")
 
-        expected_hash = compute_record_content_hash(record)
+        expected_hash = compute_record_content_hash(record, attestation=attestation)
         att_version = attestation.get("attestation_version")
         rec_approval_version = record.get("approval_version")
         if (
@@ -359,12 +419,17 @@ def evaluate_for_publication(
             reasons.append("MISSING_VALID_EVIDENCE_HASH")
 
         captured_by = attestation.get("evidence_captured_by")
+        uploaded_by = record.get("uploaded_by")
         if not isinstance(captured_by, str) or not captured_by.strip():
             reasons.append("MISSING_EVIDENCE_VERIFIER")
-        elif isinstance(reviewer_id, str) and captured_by.strip() == reviewer_id.strip():
-            reasons.append("SELF_ATTESTED_EVIDENCE_FORBIDDEN")
+        else:
+            if isinstance(reviewer_id, str) and captured_by.strip() == reviewer_id.strip():
+                reasons.append("SELF_ATTESTED_EVIDENCE_FORBIDDEN")
+            if isinstance(uploaded_by, str) and uploaded_by.strip() and captured_by.strip() == uploaded_by.strip():
+                reasons.append("UPLOADER_CANNOT_BE_EVIDENCE_VERIFIER")
 
-        if attestation.get("reviewer_id") != reviewer_id or not is_valid_iso_timestamp(attestation.get("reviewed_at")):
+        # H5: Require exact match between attestation reviewed_at and committed moderation_reviewed_at.
+        if attestation.get("reviewer_id") != reviewer_id or attestation.get("reviewed_at") != reviewed_at:
             reasons.append("ATTESTATION_SIGNOFF_MISMATCH")
         if attestation.get("privacy_decision") != "PASS" or attestation.get("rights_decision") != "PASS":
             reasons.append("ATTESTATION_COMPLIANCE_NOT_PASSED")
@@ -440,4 +505,12 @@ def sanitize_community_text(text: Any, *, max_length: int = 800) -> str:
     cleaned = " ".join(cleaned.split())
     if len(cleaned) > max_length:
         cleaned = cleaned[: max_length - 1].rstrip() + "…"
+    return cleaned
+
+
+def escape_markdown_text(text: Any, *, max_length: int = 400) -> str:
+    """Escape Markdown link/formatting syntax in untrusted community text (M2)."""
+    cleaned = sanitize_community_text(text, max_length=max_length)
+    # Neutralize Markdown link/image/emphasis metacharacters so untrusted text cannot inject links.
+    cleaned = re.sub(r"([\\\[\]\(\)\*_`~#])", r"\\\1", cleaned)
     return cleaned

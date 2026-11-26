@@ -149,6 +149,7 @@ async def save_assistant_message(
     correlation_id: str | None = None,
     generation_fence: int | None = None,
     generation_claim: str | None = None,
+    provenance_kind: str | None = None,
 ) -> bool:
     """Save the assistant's response to Firestore using a batch write."""
     db = _db()
@@ -169,6 +170,8 @@ async def save_assistant_message(
         "citations": citations,
         "createdAt": firestore.SERVER_TIMESTAMP,
     }
+    if provenance_kind is not None:
+        message_data["serverProvenanceKind"] = provenance_kind
     if generation_fence is not None:
         message_data["generationFence"] = generation_fence
 

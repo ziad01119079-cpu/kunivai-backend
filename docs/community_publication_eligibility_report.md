@@ -1,7 +1,7 @@
 # Community Knowledge Publication Eligibility Report (Existing 18 Records)
 
-**Source Dataset:** `F:\restored_files\knowledge_research\v1.3.1\community_candidate\community_knowledge.jsonl` (from `Kuniv_KB_Phase2_Readiness_v1.3.1.zip`)  
-**Policy Engine:** `app/services/community_policy.py::evaluate_for_publication` (`evaluate_community_dataset`)  
+**Source Dataset:** `F:\restored_files\knowledge_research\v1.3.1\community_candidate\community_knowledge.jsonl` (from `Kuniv_KB_Phase2_Readiness_v1.3.1.zip`)
+**Policy Engine:** `app/services/community_policy.py::evaluate_for_publication` (`evaluate_community_dataset`)
 **Date Evaluated:** 2026-11-25
 
 ## Executive Summary

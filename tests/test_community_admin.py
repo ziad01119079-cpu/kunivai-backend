@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.auth import verify_admin
+from app.auth import verify_admin, verify_community_evidence_verifier
 from app.community_repository import (
     CommunityConcurrencyError,
     CommunityIdCollisionError,
@@ -20,12 +20,19 @@ from app.community_repository import (
 from app.routers.community_admin import reset_admin_community_rate_limits, router as community_admin_router
 
 
-def _build_app(override_admin: bool = True, admin_uid: str = "admin-uid-1") -> FastAPI:
+def _build_app(
+    override_admin: bool = True,
+    admin_uid: str = "admin-uid-1",
+    override_verifier: bool = True,
+    verifier_uid: str | None = None,
+) -> FastAPI:
     reset_admin_community_rate_limits()
     app = FastAPI()
     app.include_router(community_admin_router)
     if override_admin:
         app.dependency_overrides[verify_admin] = lambda: admin_uid
+    if override_verifier:
+        app.dependency_overrides[verify_community_evidence_verifier] = lambda: (verifier_uid or admin_uid)
     return app
 
 
@@ -82,6 +89,7 @@ class _InMemoryCommunityStore:
         resumed = {
             **existing,
             "status": "CLAIMED",
+            "attempt_fence": int(existing.get("attempt_fence") or 1) + 1,
             "attempt_id": data.get("attempt_id"),
             "lease_expires_at": data.get("lease_expires_at"),
             "expected_record_ids": data.get("expected_record_ids") or expected,
@@ -90,9 +98,18 @@ class _InMemoryCommunityStore:
         self.jobs[sha] = resumed
         return "resumed", resumed
 
-    async def update_job(self, sha: str, data: dict):
-        self.jobs[sha] = dict(data)
+    async def update_job_fenced(self, sha: str, *, attempt_fence: int, job_data: dict):
+        cur = self.jobs.get(sha)
+        if not cur or cur.get("status") != "CLAIMED" or int(cur.get("attempt_fence") or 1) != attempt_fence:
+            raise CommunityConcurrencyError("Stale fence")
+        self.jobs[sha] = {**job_data, "attempt_fence": attempt_fence}
         return self.jobs[sha]
+
+    async def create_record_fenced(self, data: dict, *, source_sha256: str, attempt_fence: int, allow_same_job_resume: bool = False):
+        cur = self.jobs.get(source_sha256)
+        if not cur or cur.get("status") != "CLAIMED" or int(cur.get("attempt_fence") or 1) != attempt_fence:
+            raise CommunityConcurrencyError("Stale fence")
+        return await self.create_record_strict(data, allow_same_job_resume=allow_same_job_resume)
 
     async def get_job(self, job_id: str):
         if job_id in self.jobs:
@@ -160,9 +177,9 @@ def _patch_store(store: _InMemoryCommunityStore):
         patch("app.services.community_service.get_evidence_artifact", side_effect=store.get_evidence),
         patch("app.services.community_service.save_source_archive_idempotent", side_effect=store.save_archive),
         patch("app.services.community_service.claim_or_resume_ingestion_job", side_effect=store.claim_or_resume_job),
-        patch("app.services.community_service.update_ingestion_job", side_effect=store.update_job),
+        patch("app.services.community_service.update_ingestion_job_fenced", side_effect=store.update_job_fenced),
         patch("app.services.community_service.get_ingestion_job", side_effect=store.get_job),
-        patch("app.services.community_service.create_community_record_strict", side_effect=store.create_record_strict),
+        patch("app.services.community_service.create_community_record_fenced", side_effect=store.create_record_fenced),
         patch("app.services.community_service.get_community_record", side_effect=store.get_record),
         patch("app.services.community_service.list_community_records", side_effect=store.list_records),
         patch("app.services.community_service.transition_community_record_atomic", side_effect=store.transition_atomic),
@@ -284,7 +301,8 @@ def test_comm004_finding4_interrupted_ingestion_resumes_and_completes_instead_of
 def test_comm004_finding6_approval_requires_server_verified_independent_evidence_artifact():
     """Approval must load immutable evidence artifact, recompute SHA-256 server-side, reject forged hashes & self-attestation."""
     store = _InMemoryCommunityStore()
-    verifier_client = TestClient(_build_app(admin_uid="verifier-uid-2"))
+    uploader_client = TestClient(_build_app(admin_uid="uploader-uid-0"))
+    verifier_client = TestClient(_build_app(admin_uid="verifier-uid-2", verifier_uid="verifier-uid-2"))
     reviewer_client = TestClient(_build_app(admin_uid="reviewer-uid-1"))
 
     jsonl_line = json.dumps({
@@ -305,7 +323,7 @@ def test_comm004_finding6_approval_requires_server_verified_independent_evidence
         patches[0], patches[1], patches[2], patches[3], patches[4],
         patches[5], patches[6], patches[7], patches[8], patches[9],
     ):
-        up = reviewer_client.post("/admin/community/uploads", files={"file": ("items.jsonl", jsonl_line, "application/x-ndjson")})
+        up = uploader_client.post("/admin/community/uploads", files={"file": ("items.jsonl", jsonl_line, "application/x-ndjson")})
         assert up.status_code == 202
 
         # Register immutable evidence artifact by an INDEPENDENT verifier (verifier-uid-2).
@@ -316,11 +334,12 @@ def test_comm004_finding6_approval_requires_server_verified_independent_evidence
                 "captured_publisher": "@ku_students",
                 "captured_at": "2026-11-25T15:55:00Z",
                 "publication_date": "2026-11-20",
-                "captured_snapshot_text": "منشور عام أصلي حول متابعة الشواغر الليلية.",
+                "captured_snapshot_text": "منشور عام أصلي حول نصائح المراجعة الليلية ومتابعة الشواغر في السستم.",
             },
         )
         assert ev_res.status_code == 201
         ev = ev_res.json()["evidence"]
+        assert "captured_snapshot_text" not in ev  # C1/M3: raw snapshot minimized in API response!
         evidence_id = ev["evidence_id"]
         real_hash = ev["computed_sha256"]
 
@@ -372,6 +391,6 @@ def test_comm004_finding6_approval_requires_server_verified_independent_evidence
         assert ok.status_code == 200
         rec = ok.json()["record"]
         assert rec["moderation_status"] == "APPROVED_FOR_COMMUNITY_PUBLICATION"
-        assert rec["approval_attestation"]["digest_version"] == "v2"
+        assert rec["approval_attestation"]["digest_version"] == "v3"
         assert rec["approval_attestation"]["evidence_id"] == evidence_id
         assert rec["approval_attestation"]["evidence_captured_by"] == "verifier-uid-2"

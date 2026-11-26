@@ -1,9 +1,9 @@
-"""Isolated Firestore repository for Community Knowledge (H2, H3, H4, H6, COMM-004).
+"""Isolated Firestore repository for Community Knowledge (H1, H2, H3, H4, H5, H6, M1, COMM-006).
 
 Collections:
 - community_source_archives/{source_sha256} (bounded metadata pointer only; no multi-MiB raw body)
-- community_ingestion_jobs/{source_sha256}  (lease-owned resumable SHA-256 job)
-- community_records/{community_id}          (create-only on ingest; transactional version-checked review)
+- community_ingestion_jobs/{source_sha256}  (monotonic attempt_fence + lease-owned resumable job)
+- community_records/{community_id}          (fenced create-only on ingest; transactional version-checked review)
 - community_audit_logs/{auto_id}            (written atomically alongside moderation state transitions)
 - community_revocations/{community_id}      (authoritative retraction markers checked across replicas)
 - community_evidence_artifacts/{evidence_id} (immutable server-verified source capture artifacts)
@@ -19,6 +19,7 @@ from firebase_admin import firestore_async
 from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore
 
+from .services.community_policy import evaluate_for_publication
 from .services.coordination_runtime import distributed_enabled, get_redis_runtime
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ _published_cache: dict[str, Any] = {
 
 
 class CommunityConcurrencyError(RuntimeError):
-    """Raised on optimistic-version or monotonic invariant violation during moderation."""
+    """Raised on optimistic-version, stale attempt_fence, or monotonic invariant violation."""
 
 
 class CommunityIdCollisionError(RuntimeError):
@@ -80,7 +81,6 @@ async def _is_revoked_in_redis(community_id: str, approval_version: int) -> bool
         revoked_ver = int(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw)
         return revoked_ver >= approval_version
     except Exception:
-        # Fail closed if Redis revocation state is unreadable while distributed mode is active.
         return True
 
 
@@ -124,51 +124,64 @@ async def claim_or_resume_ingestion_job(
     *,
     now_epoch: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Atomically claim a new SHA-256 job, return completed duplicate, or reclaim a failed/expired job.
-
-    Returns `(outcome, job_dict)` where `outcome` is:
-    - `"claimed"`: new job claimed by this attempt
-    - `"resumed"`: previously FAILED or lease-expired CLAIMED job reclaimed for reconciliation
-    - `"duplicate_completed"`: job is already `QUARANTINED` with the full expected record set
-    Raises `CommunityIngestionInProgressError` if actively leased by another worker.
+    """Atomically claim a new SHA-256 job with monotonic attempt_fence, verify durable duplicate,
+    or reclaim a FAILED / lease-expired job with `attempt_fence = current + 1` (H1).
     """
     db = firestore_async.client()
     sha256 = str(job_data["source_sha256"])
     doc_ref = db.collection(JOBS_COLLECTION).document(sha256)
     now = now_epoch if now_epoch is not None else time.time()
+    incoming_expected = list(job_data.get("expected_record_ids") or [])
 
     @firestore.async_transactional
     async def _claim(transaction):
         snap = await doc_ref.get(transaction=transaction)
         if not snap.exists:
-            transaction.create(doc_ref, job_data)
-            return "claimed", dict(job_data)
+            claimed = {**job_data, "attempt_fence": 1}
+            transaction.create(doc_ref, claimed)
+            return "claimed", claimed
 
         existing = snap.to_dict() or {}
         status = existing.get("status")
-        expected = existing.get("expected_record_ids") or []
-        written = existing.get("record_ids") or []
+        stored_expected = list(existing.get("expected_record_ids") or [])
+        written = list(existing.get("record_ids") or [])
+        current_fence = int(existing.get("attempt_fence") or 1)
+
         if (
             status == "QUARANTINED"
-            and expected
-            and set(written) == set(expected)
-            and len(written) == len(expected)
+            and stored_expected
+            and stored_expected == incoming_expected
+            and set(written) == set(incoming_expected)
+            and len(written) == len(incoming_expected)
         ):
-            return "duplicate_completed", existing
+            # H1: Verify every expected record actually exists durably with matching source_sha256.
+            all_durable = True
+            for cid in incoming_expected:
+                rec_snap = await db.collection(RECORDS_COLLECTION).document(cid).get(transaction=transaction)
+                if not rec_snap.exists:
+                    all_durable = False
+                    break
+                rec_data = rec_snap.to_dict() or {}
+                if rec_data.get("source_sha256") != sha256:
+                    all_durable = False
+                    break
+            if all_durable:
+                return "duplicate_completed", existing
 
         lease_expires = float(existing.get("lease_expires_at") or 0.0)
         if status == "CLAIMED" and lease_expires > now:
             raise CommunityIngestionInProgressError(
-                f"Ingestion job for SHA '{sha256[:12]}' is currently in progress."
+                f"Ingestion job for SHA '{sha256[:12]}' is currently in progress (fence={current_fence})."
             )
 
-        # Reclaim FAILED or lease-expired CLAIMED job for resumable reconciliation.
+        next_fence = current_fence + 1
         resumed = {
             **existing,
             "status": "CLAIMED",
+            "attempt_fence": next_fence,
             "attempt_id": job_data.get("attempt_id"),
             "lease_expires_at": job_data.get("lease_expires_at"),
-            "expected_record_ids": job_data.get("expected_record_ids") or expected,
+            "expected_record_ids": incoming_expected or stored_expected,
             "updated_at": job_data.get("updated_at"),
             "error": None,
         }
@@ -178,11 +191,43 @@ async def claim_or_resume_ingestion_job(
     return await _claim(db.transaction())
 
 
-async def update_ingestion_job(source_sha256: str, job_data: dict[str, Any]) -> dict[str, Any]:
-    """Update a claimed ingestion job with final extraction counts."""
+async def update_ingestion_job_fenced(
+    source_sha256: str,
+    *,
+    attempt_fence: int,
+    job_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically update/finalize an ingestion job ONLY if `attempt_fence` matches active CLAIMED owner (H1)."""
     db = firestore_async.client()
-    await db.collection(JOBS_COLLECTION).document(source_sha256).set(job_data)
-    return job_data
+    doc_ref = db.collection(JOBS_COLLECTION).document(source_sha256)
+
+    @firestore.async_transactional
+    async def _update(transaction):
+        snap = await doc_ref.get(transaction=transaction)
+        if not snap.exists:
+            raise CommunityConcurrencyError(f"Ingestion job '{source_sha256[:12]}' does not exist.")
+        current = snap.to_dict() or {}
+        cur_fence = int(current.get("attempt_fence") or 0)
+        cur_status = current.get("status")
+        if cur_status == "QUARANTINED":
+            raise CommunityConcurrencyError(
+                f"Cannot overwrite terminal QUARANTINED job '{source_sha256[:12]}' from stale fence={attempt_fence}."
+            )
+        if cur_status != "CLAIMED" or cur_fence != attempt_fence:
+            raise CommunityConcurrencyError(
+                f"Stale ingestion attempt fence={attempt_fence} (current fence={cur_fence}, status={cur_status})."
+            )
+        updated = {**job_data, "attempt_fence": attempt_fence}
+        transaction.set(doc_ref, updated)
+        return updated
+
+    return await _update(db.transaction())
+
+
+async def update_ingestion_job(source_sha256: str, job_data: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible wrapper requiring valid attempt_fence."""
+    fence = int(job_data.get("attempt_fence") or 1)
+    return await update_ingestion_job_fenced(source_sha256, attempt_fence=fence, job_data=job_data)
 
 
 async def get_ingestion_job(job_id: str) -> dict[str, Any] | None:
@@ -197,6 +242,52 @@ async def get_ingestion_job(job_id: str) -> dict[str, Any] | None:
         if data:
             return data
     return None
+
+
+async def create_community_record_fenced(
+    record_data: dict[str, Any],
+    *,
+    source_sha256: str,
+    attempt_fence: int,
+    allow_same_job_resume: bool = False,
+) -> dict[str, Any]:
+    """Atomically verify active ingestion `attempt_fence` before creating a quarantined record (H1)."""
+    db = firestore_async.client()
+    community_id = str(record_data["community_id"])
+    job_ref = db.collection(JOBS_COLLECTION).document(source_sha256)
+    rec_ref = db.collection(RECORDS_COLLECTION).document(community_id)
+
+    @firestore.async_transactional
+    async def _create(transaction):
+        job_snap = await job_ref.get(transaction=transaction)
+        if not job_snap.exists:
+            raise CommunityConcurrencyError("Ingestion job missing during fenced record write.")
+        job = job_snap.to_dict() or {}
+        if job.get("status") != "CLAIMED" or int(job.get("attempt_fence") or 0) != attempt_fence:
+            raise CommunityConcurrencyError(
+                f"Stale ingestion attempt fence={attempt_fence} cannot write record '{community_id}'."
+            )
+
+        rec_snap = await rec_ref.get(transaction=transaction)
+        if rec_snap.exists:
+            existing = rec_snap.to_dict() or {}
+            if (
+                allow_same_job_resume
+                and existing.get("source_sha256") == source_sha256
+                and existing.get("ingestion_job_id") == record_data.get("ingestion_job_id")
+                and existing.get("moderation_status") != "APPROVED_FOR_COMMUNITY_PUBLICATION"
+                and existing.get("index_namespace") == "COMMUNITY_CANDIDATE_ONLY"
+            ):
+                return existing
+            raise CommunityIdCollisionError(
+                f"Community record '{community_id}' already exists and cannot be overwritten by ingestion."
+            )
+        transaction.create(rec_ref, record_data)
+        return dict(record_data)
+
+    result = await _create(db.transaction())
+    invalidate_community_cache()
+    return result
 
 
 async def create_community_record_strict(
@@ -300,7 +391,6 @@ async def transition_community_record_atomic(
         ):
             raise CommunityConcurrencyError("Audit record does not match current state.")
 
-        # COMM-004 Finding 5: Enforce approval_version monotonicity on EVERY transition.
         previous_approval = current.get("approval_version")
         proposed_approval = new_record.get("approval_version")
         if type(previous_approval) is not int or type(proposed_approval) is not int:
@@ -349,11 +439,19 @@ async def transition_community_record_atomic(
 
 
 async def verify_record_not_revoked(community_id: str, approval_version: int) -> bool:
-    """Authoritative revocation & version check against Redis + Firestore (H2).
+    """Authoritative delivery/replay check against Redis + Firestore + full v3 digest + expiry + evidence (H2, H5).
 
-    Returns True ONLY if the record is still published at `approval_version` and
-    has not been retracted. Fails closed (returns False) on any lookup error.
+    Returns True ONLY if:
+    - Not revoked in Redis or `community_revocations`
+    - Current record exists at exact `approval_version`
+    - Current record passes FULL `evaluate_for_publication(..., require_published_namespace=True)`
+      (validating current v3 approval digest, attestation fields, expiry, and PII/defamation)
+    - Linked immutable evidence artifact still exists in `community_evidence_artifacts`
+    Fails closed (returns False) on any error.
     """
+    if type(approval_version) is not int or approval_version < 1:
+        return False
+
     redis_revoked = await _is_revoked_in_redis(community_id, approval_version)
     if redis_revoked is True:
         return False
@@ -370,12 +468,25 @@ async def verify_record_not_revoked(community_id: str, approval_version: int) ->
         if not rec_snap.exists:
             return False
         rec = rec_snap.to_dict() or {}
-        if rec.get("moderation_status") != "APPROVED_FOR_COMMUNITY_PUBLICATION":
+        if type(rec.get("approval_version")) is not int or rec["approval_version"] != approval_version:
             return False
-        if rec.get("index_namespace") != "COMMUNITY_PUBLISHED":
+
+        # H5: Re-validate FULL v3 digest, attestation fields, namespace, and expiry against live DB record!
+        decision = evaluate_for_publication(rec, require_published_namespace=True)
+        if not decision.allowed:
             return False
-        if int(rec.get("approval_version") or 0) != approval_version:
+
+        # H5: Verify linked immutable evidence artifact is still available.
+        ev_id = str(rec.get("evidence_id") or "").strip()
+        if not ev_id:
             return False
+        ev_snap = await db.collection(EVIDENCE_COLLECTION).document(ev_id).get()
+        if not ev_snap.exists:
+            return False
+        ev_data = ev_snap.to_dict() or {}
+        if ev_data.get("computed_sha256") != rec.get("evidence_hash"):
+            return False
+
         return True
     except Exception as exc:
         logger.warning("Authoritative revocation check failed closed for %s (%s)", community_id, type(exc).__name__)
@@ -387,20 +498,15 @@ async def query_published_community_records(
     limit: int = 100,
     use_cache: bool = True,
 ) -> list[dict[str, Any]]:
-    """Load records marked APPROVED_FOR_COMMUNITY_PUBLICATION in the isolated store.
+    """Load candidate published records (bounded TTL cache).
 
-    Cache hits are ALWAYS re-validated against authoritative revocation/version
-    state before returning (H2). Callers MUST still apply `filter_retrieved_community()`.
+    M1: Ranking happens BEFORE bounded authoritative re-verification of top-K matches
+    in `community_service.py` (which always calls `verify_records_still_published` on
+    every selected record before use). On cache hit, still drop any locally/Redis revoked items.
     """
     now = time.monotonic()
     if use_cache and _published_cache["records"] is not None and now < _published_cache["expires_at"]:
-        verified_cached: list[dict[str, Any]] = []
-        for rec in _published_cache["records"][:limit]:
-            cid = str(rec.get("community_id") or "")
-            ver = int(rec.get("approval_version") or 0)
-            if cid and ver >= 1 and await verify_record_not_revoked(cid, ver):
-                verified_cached.append(rec)
-        return verified_cached
+        return list(_published_cache["records"][:limit])
 
     db = firestore_async.client()
     query = (
