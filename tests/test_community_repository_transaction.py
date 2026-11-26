@@ -194,3 +194,86 @@ def test_approval_version_cannot_jump_or_change_type(monkeypatch, new_version):
         ))
     assert db.docs[(repo.RECORDS_COLLECTION, cid)] == old
     assert audit_count(db) == 0
+
+
+@pytest.mark.parametrize("bad_approval", [0, 2, -1, True, "1", None])
+def test_comm004_finding5_non_approval_transition_rejects_altered_approval_version(monkeypatch, bad_approval):
+    """Non-approval transitions (REJECTED / RETRACTED) must preserve approval_version unchanged."""
+    cid = "CM-NON-APPROVAL-MONO"
+    old = rec(cid, 2, "APPROVED_FOR_COMMUNITY_PUBLICATION", 1)
+    db = FakeDB(cid, old)
+    backend(monkeypatch, db)
+    with pytest.raises(repo.CommunityConcurrencyError):
+        asyncio.run(repo.transition_community_record_atomic(
+            cid,
+            expected_version=2,
+            new_record=rec(cid, 3, "RETRACTED", bad_approval),
+            audit_entry=aud(cid, 2, old["moderation_status"], "RETRACTED"),
+            retraction_marker={"community_id": cid, "revoked_approval_version": 1},
+        ))
+    assert db.docs[(repo.RECORDS_COLLECTION, cid)] == old
+    assert audit_count(db) == 0
+
+
+def test_comm004_finding5_redis_postcommit_failure_does_not_fail_firestore_retraction(monkeypatch):
+    """If Redis broadcast raises postcommit, Firestore retraction remains committed and authoritative."""
+    cid = "CM-REDIS-FAIL"
+    old = rec(cid, 2, "APPROVED_FOR_COMMUNITY_PUBLICATION", 1)
+    db = FakeDB(cid, old)
+    backend(monkeypatch, db)
+    # Restore real _publish_distributed_revocation with a failing Redis client.
+    monkeypatch.setattr(repo, "distributed_enabled", lambda: True)
+
+    class _FailingRedisClient:
+        async def hset(self, *_args, **_kwargs):
+            raise RuntimeError("Redis down")
+
+    fake_runtime = type("R", (), {"client": _FailingRedisClient(), "requests": type("Req", (), {"prefix": "kuniv"})()})()
+    monkeypatch.setattr(repo, "get_redis_runtime", lambda: fake_runtime)
+    monkeypatch.setattr(repo, "_publish_distributed_revocation", repo._publish_distributed_revocation)
+
+    result = asyncio.run(repo.transition_community_record_atomic(
+        cid,
+        expected_version=2,
+        new_record=rec(cid, 3, "RETRACTED", 1),
+        audit_entry=aud(cid, 2, old["moderation_status"], "RETRACTED"),
+        retraction_marker={"community_id": cid, "revoked_approval_version": 1},
+    ))
+    assert result["moderation_status"] == "RETRACTED"
+    assert db.docs[(repo.REVOCATIONS_COLLECTION, cid)]["revoked_approval_version"] == 1
+    assert audit_count(db) == 1
+
+
+@pytest.mark.parametrize("order", ["approve_first", "retract_first"])
+def test_comm004_finding5_concurrent_approve_vs_retract_both_orderings(monkeypatch, order):
+    """Concurrent approve vs retract on same expected_version: exactly one wins, the other raises ConcurrencyError."""
+    cid = f"CM-RACE-{order}"
+    old = rec(cid, 2, "APPROVED_FOR_COMMUNITY_PUBLICATION", 1)
+    db = FakeDB(cid, old)
+    backend(monkeypatch, db)
+
+    async def do_approve():
+        return await repo.transition_community_record_atomic(
+            cid,
+            expected_version=2,
+            new_record=rec(cid, 3, "APPROVED_FOR_COMMUNITY_PUBLICATION", 2),
+            audit_entry=aud(cid, 2, old["moderation_status"], "APPROVED_FOR_COMMUNITY_PUBLICATION"),
+        )
+
+    async def do_retract():
+        return await repo.transition_community_record_atomic(
+            cid,
+            expected_version=2,
+            new_record=rec(cid, 3, "RETRACTED", 1),
+            audit_entry=aud(cid, 2, old["moderation_status"], "RETRACTED"),
+            retraction_marker={"community_id": cid, "revoked_approval_version": 1},
+        )
+
+    async def go():
+        tasks = (do_approve(), do_retract()) if order == "approve_first" else (do_retract(), do_approve())
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = asyncio.run(go())
+    assert sum(isinstance(r, dict) for r in results) == 1
+    assert sum(isinstance(r, repo.CommunityConcurrencyError) for r in results) == 1
+    assert audit_count(db) == 1

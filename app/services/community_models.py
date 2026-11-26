@@ -3,7 +3,7 @@
 Community Knowledge is strictly isolated from Official University Knowledge
 and student private schedules. Every ingested item starts in quarantine,
 separates unverified imported claims from server-managed approval attestations,
-and cannot be served to students until it passes the fail-closed dual-gate policy.
+and links every approval to an immutable server-verified evidence artifact.
 """
 
 from __future__ import annotations
@@ -68,16 +68,44 @@ class IngestionJobStatus(str, Enum):
     FAILED = "FAILED"
 
 
-class ApprovalAttestation(BaseModel):
-    """Server-managed, version-bound approval record tied to exact content and source evidence."""
+class EvidenceArtifactCreateRequest(BaseModel):
+    """Request to register an immutable independently captured source evidence artifact."""
 
-    attestation_version: int = Field(ge=1)
-    approved_content_hash: str
     canonical_source_url: str
     captured_publisher: str
     captured_at: str
     publication_date: str
+    captured_snapshot_text: str = Field(..., min_length=10, max_length=16000)
+
+
+class EvidenceArtifact(BaseModel):
+    """Immutable server-verified evidence artifact stored in `community_evidence_artifacts`."""
+
+    evidence_id: str
+    canonical_source_url: str
+    captured_publisher: str
+    captured_at: str
+    publication_date: str
+    captured_snapshot_text: str
+    computed_sha256: str
+    captured_by: str
+    created_at: str
+    immutable: bool = True
+
+
+class ApprovalAttestation(BaseModel):
+    """Server-managed, version-bound approval record tied to full approval digest and evidence artifact."""
+
+    digest_version: Literal["v2"] = "v2"
+    attestation_version: int = Field(ge=1)
+    approved_content_hash: str
+    evidence_id: str
     evidence_hash: str
+    evidence_captured_by: str
+    canonical_source_url: str
+    captured_publisher: str
+    captured_at: str
+    publication_date: str
     reviewer_id: str
     reviewed_at: str
     privacy_decision: Literal["PASS", "FAIL"]
@@ -105,9 +133,11 @@ class CommunityRecord(BaseModel):
     reputational_review_status: str | None = None
     moderation_reviewer_id: str | None = None
     moderation_reviewed_at: str | None = None
-    # Version-bound approval attestation & content hash (C1 / H2 / H4)
+    # Version-bound approval attestation & full canonical digest (C1 / H2 / H4 / COMM-004)
     record_version: int = Field(default=1, ge=1)
     approval_version: int = Field(default=0, ge=0)
+    evidence_id: str | None = None
+    evidence_hash: str | None = None
     approved_content_hash: str | None = None
     approval_attestation: ApprovalAttestation | None = None
     # Imported claims kept strictly separate from trusted server attestations
@@ -151,6 +181,9 @@ class CommunityIngestionJob(BaseModel):
     source_sha256: str
     filename: str
     status: str = IngestionJobStatus.CLAIMED.value
+    attempt_id: str | None = None
+    lease_expires_at: float | None = None
+    expected_record_ids: list[str] = Field(default_factory=list)
     total_extracted: int = 0
     quarantined_count: int = 0
     blocked_sensitive_count: int = 0
@@ -166,6 +199,7 @@ class CommunityIngestionJob(BaseModel):
 class CommunityReviewActionRequest(BaseModel):
     action: Literal["approve", "reject", "retract"]
     expected_version: int | None = Field(default=None, ge=1)
+    evidence_id: str | None = None
     original_source_link: str | None = None
     publication_date: str | None = None
     captured_publisher: str | None = None

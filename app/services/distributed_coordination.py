@@ -15,6 +15,12 @@ import logging
 
 from redis.exceptions import RedisError
 
+from .community_replay_guard import (
+    REPLAY_REVOKED_NOTICE_AR,
+    community_revoked_replay_error,
+    filter_sse_event_for_replay,
+)
+
 from ..logger import generation_fence_var
 
 logger = logging.getLogger(__name__)
@@ -297,6 +303,8 @@ class RedisCoordinator:
             await self._start_pump(request_key, ownership.fence, factory)
 
         heartbeat_at = time.monotonic() + 10
+        had_non_community_chunk = False
+        any_community_revoked = False
         while True:
             state = await self.redis.hgetall(meta)
             status = state.get(b"status", state.get("status"))
@@ -321,8 +329,23 @@ class RedisCoordinator:
                     cursor = event_id.decode() if isinstance(event_id, bytes) else event_id
                     raw = fields.get(b"event", fields.get("event"))
                     event = raw.decode() if isinstance(raw, bytes) else raw
-                    yield f"id: {cursor}\n{event}"
-                    if self._terminal(event):
+                    filtered_event, revoked, is_official_chunk = await filter_sse_event_for_replay(event)
+                    if is_official_chunk:
+                        had_non_community_chunk = True
+                    if revoked:
+                        any_community_revoked = True
+                    if filtered_event is None:
+                        continue
+                    if any_community_revoked and self._terminal(filtered_event):
+                        if had_non_community_chunk:
+                            notice = "data: " + json.dumps({"type": "chunk", "content": REPLAY_REVOKED_NOTICE_AR}, ensure_ascii=False) + "\n\n"
+                            yield f"id: {cursor}\n{notice}"
+                            yield f"id: {cursor}\n{filtered_event}"
+                            return
+                        yield f"id: {cursor}\n{community_revoked_replay_error()}"
+                        return
+                    yield f"id: {cursor}\n{filtered_event}"
+                    if self._terminal(filtered_event):
                         return
                     heartbeat_at = time.monotonic() + 10
             if time.monotonic() >= heartbeat_at:

@@ -19,15 +19,20 @@ import hashlib
 import json
 import logging
 import re
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from ..community_repository import (
     CommunityConcurrencyError,
     CommunityIdCollisionError,
-    claim_ingestion_job_atomic,
+    CommunityIngestionInProgressError,
+    claim_or_resume_ingestion_job,
     create_community_record_strict,
+    create_evidence_artifact_immutable,
     get_community_record,
+    get_evidence_artifact,
     get_ingestion_job,
     list_community_records,
     query_published_community_records,
@@ -46,6 +51,8 @@ from .community_models import (
     CommunityRetrievalResult,
     CommunityReviewActionRequest,
     ContentNature,
+    EvidenceArtifact,
+    EvidenceArtifactCreateRequest,
     IndexNamespace,
     IngestionJobStatus,
     ModerationStatus,
@@ -53,12 +60,16 @@ from .community_models import (
     ReviewStatus,
 )
 from .community_policy import (
+    APPROVAL_DIGEST_VERSION,
     Decision,
+    compute_evidence_snapshot_sha256,
     compute_record_content_hash,
     detect_pii_or_defamation_signals,
     evaluate_for_publication,
     filter_retrieved_community,
+    is_valid_iso_date,
     is_valid_iso_timestamp,
+    is_valid_public_url,
     is_valid_sha256_hex,
     sanitize_community_text,
 )
@@ -459,6 +470,47 @@ def parse_uploaded_community_content(
     return records
 
 
+INGESTION_LEASE_SECONDS = 60.0
+
+
+async def register_evidence_artifact(
+    *,
+    request: EvidenceArtifactCreateRequest,
+    captured_by: str,
+) -> dict[str, Any]:
+    """Capture and persist an immutable evidence artifact with server-computed SHA-256 (COMM-004 Finding 6)."""
+    if not is_valid_public_url(request.canonical_source_url):
+        raise CommunityValidationError("Evidence canonical_source_url must be a valid public post https:// URL.")
+    if not request.captured_publisher.strip():
+        raise CommunityValidationError("Evidence captured_publisher cannot be empty.")
+    if not is_valid_iso_timestamp(request.captured_at):
+        raise CommunityValidationError("Evidence captured_at must be a valid ISO-8601 UTC timestamp.")
+    if not is_valid_iso_date(request.publication_date, allow_future=False):
+        raise CommunityValidationError("Evidence publication_date must be a valid non-future YYYY-MM-DD date.")
+
+    computed_sha256 = compute_evidence_snapshot_sha256(
+        canonical_source_url=request.canonical_source_url,
+        captured_publisher=request.captured_publisher,
+        captured_at=request.captured_at,
+        publication_date=request.publication_date,
+        captured_snapshot_text=request.captured_snapshot_text,
+    )
+    evidence_id = f"ev-{computed_sha256[:16]}"
+    artifact = EvidenceArtifact(
+        evidence_id=evidence_id,
+        canonical_source_url=request.canonical_source_url.strip(),
+        captured_publisher=request.captured_publisher.strip(),
+        captured_at=request.captured_at.strip(),
+        publication_date=request.publication_date.strip(),
+        captured_snapshot_text=request.captured_snapshot_text,
+        computed_sha256=computed_sha256,
+        captured_by=captured_by,
+        created_at=_utc_now_iso(),
+        immutable=True,
+    )
+    return await create_evidence_artifact_immutable(artifact.model_dump(mode="json"))
+
+
 async def ingest_community_upload(
     *,
     filename: str,
@@ -466,9 +518,11 @@ async def ingest_community_upload(
     raw_bytes: bytes,
     uploaded_by: str,
 ) -> tuple[dict[str, Any], bool]:
-    """Validate, atomically claim job by SHA-256, archive pointer, and quarantine records.
+    """Validate, lease-claim/resume job by SHA-256, archive pointer, and quarantine records.
 
-    Returns (job_dict, is_duplicate). Validates & parses BEFORE any durable write (H3/H4).
+    Returns (job_dict, is_duplicate). Only returns `is_duplicate=True` when a prior job
+    reached `QUARANTINED` with the full expected record set; interrupted/failed jobs are
+    safely reclaimed and reconciled without overwriting published records (COMM-004 Finding 4).
     """
     source_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     now_iso = _utc_now_iso()
@@ -486,27 +540,36 @@ async def ingest_community_upload(
     )
 
     # Check for duplicate community_ids within the same upload.
+    expected_record_ids: list[str] = []
     seen_ids: set[str] = set()
     for rec in records:
         if rec.community_id in seen_ids:
             raise CommunityValidationError(f"Duplicate community_id '{rec.community_id}' inside upload.")
         seen_ids.add(rec.community_id)
+        expected_record_ids.append(rec.community_id)
 
-    # H4: Atomically claim the full SHA-256 job BEFORE side effects.
+    # COMM-004 Finding 4: Lease-owned claim/resume BEFORE side effects.
+    attempt_id = uuid.uuid4().hex
+    lease_expires_at = time.time() + INGESTION_LEASE_SECONDS
     initial_job = CommunityIngestionJob(
         job_id=job_id,
         archive_id=source_sha256,
         source_sha256=source_sha256,
         filename=filename,
         status=IngestionJobStatus.CLAIMED.value,
+        attempt_id=attempt_id,
+        lease_expires_at=lease_expires_at,
+        expected_record_ids=expected_record_ids,
         total_extracted=len(records),
         created_by=uploaded_by,
         created_at=now_iso,
         updated_at=now_iso,
     )
-    claimed, existing_job = await claim_ingestion_job_atomic(initial_job.model_dump(mode="json"))
-    if not claimed:
-        return existing_job, True
+    outcome, job_state = await claim_or_resume_ingestion_job(initial_job.model_dump(mode="json"))
+    if outcome == "duplicate_completed":
+        return job_state, True
+
+    is_resumed = outcome == "resumed"
 
     # H3/H6: Store only bounded archive metadata pointer in Firestore (never multi-MiB raw body).
     has_pii, _ = detect_pii_or_defamation_signals(raw_text[:512])
@@ -533,11 +596,15 @@ async def ingest_community_upload(
     try:
         for rec in records:
             rec_dict = rec.model_dump(mode="json")
-            await create_community_record_strict(rec_dict)
-            record_ids.append(rec.community_id)
-            if rec.moderation_status == ModerationStatus.BLOCKED_SENSITIVE_DEFAMATION_REVIEW.value:
+            saved_rec = await create_community_record_strict(
+                rec_dict,
+                allow_same_job_resume=is_resumed,
+            )
+            record_ids.append(saved_rec["community_id"])
+            status_val = saved_rec.get("moderation_status")
+            if status_val == ModerationStatus.BLOCKED_SENSITIVE_DEFAMATION_REVIEW.value:
                 blocked_sensitive_count += 1
-            elif rec.moderation_status == ModerationStatus.EXCLUDED_MUST_USE_OFFICIAL_KB.value:
+            elif status_val == ModerationStatus.EXCLUDED_MUST_USE_OFFICIAL_KB.value:
                 excluded_official_count += 1
             else:
                 quarantined_count += 1
@@ -549,6 +616,7 @@ async def ingest_community_upload(
                 "quarantined_count": quarantined_count,
                 "blocked_sensitive_count": blocked_sensitive_count,
                 "excluded_official_count": excluded_official_count,
+                "lease_expires_at": 0.0,
                 "updated_at": _utc_now_iso(),
                 "error": f"{type(exc).__name__}: {exc}",
             }
@@ -565,6 +633,7 @@ async def ingest_community_upload(
             "excluded_official_count": excluded_official_count,
             "published_count": 0,
             "record_ids": record_ids,
+            "lease_expires_at": 0.0,
             "updated_at": _utc_now_iso(),
         }
     )
@@ -661,24 +730,65 @@ async def apply_review_action(
     retraction_marker: dict[str, Any] | None = None
 
     if request.action == "approve":
-        # C1: Require independent captured publisher, valid capture timestamp, and SHA-256 evidence hash.
+        # COMM-004 Finding 6: Load & recompute digest of immutable server-stored evidence artifact.
         pre_reasons: list[str] = []
-        if not request.captured_publisher or not request.captured_publisher.strip():
-            pre_reasons.append("MISSING_CAPTURED_PUBLISHER")
-        captured_at = request.captured_at or now_iso
-        if not is_valid_iso_timestamp(captured_at):
-            pre_reasons.append("INVALID_CAPTURED_TIMESTAMP")
-        if not is_valid_sha256_hex(request.evidence_hash):
-            pre_reasons.append("MISSING_VALID_EVIDENCE_HASH")
+        if not request.evidence_id or not request.evidence_id.strip():
+            pre_reasons.append("MISSING_EVIDENCE_ID")
+            raise CommunityPublicationDeniedError(pre_reasons)
+
+        artifact = await get_evidence_artifact(request.evidence_id.strip())
+        if artifact is None:
+            raise CommunityPublicationDeniedError(["MISSING_EVIDENCE_ARTIFACT"])
+
+        # Recompute SHA-256 server-side from the immutable artifact snapshot (rejects forged hashes).
+        recomputed_sha = compute_evidence_snapshot_sha256(
+            canonical_source_url=str(artifact.get("canonical_source_url") or ""),
+            captured_publisher=str(artifact.get("captured_publisher") or ""),
+            captured_at=str(artifact.get("captured_at") or ""),
+            publication_date=str(artifact.get("publication_date") or ""),
+            captured_snapshot_text=str(artifact.get("captured_snapshot_text") or ""),
+        )
+        if artifact.get("computed_sha256") != recomputed_sha:
+            pre_reasons.append("EVIDENCE_ARTIFACT_CORRUPTED")
+        if request.evidence_hash is not None and request.evidence_hash.strip().lower() != recomputed_sha:
+            pre_reasons.append("EVIDENCE_DIGEST_MISMATCH")
+
+        evidence_captured_by = str(artifact.get("captured_by") or "").strip()
+        if not evidence_captured_by:
+            pre_reasons.append("MISSING_EVIDENCE_VERIFIER")
+        elif evidence_captured_by == reviewer_uid.strip():
+            pre_reasons.append("SELF_ATTESTED_EVIDENCE_FORBIDDEN")
+
+        if existing.get("source_sha256") and recomputed_sha == existing.get("source_sha256"):
+            pre_reasons.append("EVIDENCE_NOT_INDEPENDENT_OF_UPLOAD")
+
+        art_url = str(artifact.get("canonical_source_url") or "").strip()
+        art_pub = str(artifact.get("captured_publisher") or "").strip()
+        art_captured_at = str(artifact.get("captured_at") or "").strip()
+        art_date = str(artifact.get("publication_date") or "").strip()
+
+        if merged.get("original_source_link") and merged.get("original_source_link") != art_url:
+            pre_reasons.append("EVIDENCE_URL_MISMATCH")
+        if merged.get("publication_date") and merged.get("publication_date") != art_date:
+            pre_reasons.append("EVIDENCE_DATE_MISMATCH")
+        if request.captured_publisher and request.captured_publisher.strip() != art_pub:
+            pre_reasons.append("EVIDENCE_PUBLISHER_MISMATCH")
+
         if pre_reasons:
             raise CommunityPublicationDeniedError(pre_reasons)
 
         next_approval_version = current_approval_version + 1
+        merged["original_source_link"] = art_url
+        merged["publication_date"] = art_date
         merged["moderation_status"] = ModerationStatus.APPROVED_FOR_COMMUNITY_PUBLICATION.value
         merged["index_namespace"] = IndexNamespace.COMMUNITY_PUBLISHED.value
         merged["retracted_at"] = None
         merged["retraction_reason"] = None
         merged["approval_version"] = next_approval_version
+        merged["evidence_id"] = request.evidence_id.strip()
+        merged["evidence_hash"] = recomputed_sha
+
+        # Full v2 canonical approval digest over ALL gate-driving fields + evidence IDs.
         content_hash = compute_record_content_hash(merged)
         merged["approved_content_hash"] = content_hash
 
@@ -689,13 +799,16 @@ async def apply_review_action(
             else "NOT_APPLICABLE"
         )
         attestation = ApprovalAttestation(
+            digest_version=APPROVAL_DIGEST_VERSION,
             attestation_version=next_approval_version,
             approved_content_hash=content_hash,
-            canonical_source_url=str(merged.get("original_source_link") or ""),
-            captured_publisher=request.captured_publisher.strip(),
-            captured_at=captured_at,
-            publication_date=str(merged.get("publication_date") or ""),
-            evidence_hash=str(request.evidence_hash).strip().lower(),
+            evidence_id=request.evidence_id.strip(),
+            evidence_hash=recomputed_sha,
+            evidence_captured_by=evidence_captured_by,
+            canonical_source_url=art_url,
+            captured_publisher=art_pub,
+            captured_at=art_captured_at,
+            publication_date=art_date,
             reviewer_id=reviewer_uid,
             reviewed_at=now_iso,
             privacy_decision="PASS" if merged.get("privacy_review_status") == "PASS" else "FAIL",

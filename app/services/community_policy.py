@@ -1,13 +1,15 @@
 """Fail-closed publication and post-retrieval gate for Community Knowledge.
 
-Enforces the Kuniv AI Community Knowledge contract (C1, H2, H5, M2):
+Enforces the Kuniv AI Community Knowledge contract (C1, H2, H5, M2, COMM-004):
 - Strict type validation (no string-valued booleans, no non-string enums, no crash on malformed URLs).
 - Canonical public https:// post URLs only (rejects example/reserved domains, bare homepages, local/private hosts).
 - Strict ISO publication date (YYYY-MM-DD) rejecting future dates.
 - Strict ISO-8601 UTC timestamp validation for reviewer signoff and capture timestamps.
-- Independent, version-bound `approval_attestation` tied to `approved_content_hash` + `evidence_hash` + `captured_publisher`.
+- Canonical v2 approval digest binding EVERY gate-driving metadata, provenance,
+  compliance, isolation, reviewer, source/archive, and immutable evidence field.
+- Independent `approval_attestation` with `digest_version == "v2"`, `evidence_id`,
+  and `evidence_captured_by` distinct from `reviewer_id`.
 - Re-scans topic, summary, and URL for PII and defamation signals on EVERY gate evaluation.
-- Post-retrieval filter requires `COMMUNITY_PUBLISHED` namespace and rejects retracted/expired/tampered records.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ from datetime import date, datetime, timezone
 from ipaddress import ip_address
 from typing import Any, Iterable
 from urllib.parse import urlparse
+
+APPROVAL_DIGEST_VERSION = "v2"
 
 ALLOWED_CONTENT_NATURES = frozenset({
     "PERSONAL_OPINION",
@@ -56,6 +60,37 @@ _SENSITIVE_DEFAMATION_PATTERNS = (
     r"(?:worst professor|terrible professor|corrupt|unfair|avoid at all costs|impossible to pass)",
 )
 
+# Canonical v2 allowlist of EVERY gate-driving field bound into the approval digest.
+# Deliberately excludes `approved_content_hash` and `approval_attestation` to avoid circularity.
+APPROVAL_DIGEST_FIELDS: tuple[str, ...] = (
+    "community_id",
+    "dedup_group_id",
+    "independent_author_key_hash",
+    "category",
+    "content_nature",
+    "topic_ar",
+    "summary_sanitized_ar",
+    "original_source_link",
+    "publication_date",
+    "provenance_status",
+    "source_confidence",
+    "privacy_review_status",
+    "rights_review_status",
+    "reputational_review_status",
+    "identifiable_person_mentioned",
+    "defamation_or_sensitivity_flag",
+    "valid_until",
+    "index_namespace",
+    "isolated_from_official_kb",
+    "moderation_reviewer_id",
+    "moderation_reviewed_at",
+    "source_sha256",
+    "source_archive_path",
+    "approval_version",
+    "evidence_id",
+    "evidence_hash",
+)
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -63,16 +98,36 @@ class Decision:
     reasons: list[str]
 
 
-def compute_record_content_hash(record: dict[str, Any]) -> str:
-    """Deterministic SHA-256 over the immutable content & provenance fields bound by approval."""
+def compute_evidence_snapshot_sha256(
+    *,
+    canonical_source_url: str,
+    captured_publisher: str,
+    captured_at: str,
+    publication_date: str,
+    captured_snapshot_text: str,
+) -> str:
+    """Server-side canonical SHA-256 over an immutable captured evidence snapshot."""
     payload = {
-        "topic_ar": str(record.get("topic_ar") or ""),
-        "summary_sanitized_ar": str(record.get("summary_sanitized_ar") or ""),
-        "original_source_link": str(record.get("original_source_link") or ""),
-        "publication_date": str(record.get("publication_date") or ""),
-        "content_nature": str(record.get("content_nature") or ""),
-        "category": str(record.get("category") or ""),
+        "canonical_source_url": canonical_source_url.strip(),
+        "captured_publisher": captured_publisher.strip(),
+        "captured_at": captured_at.strip(),
+        "publication_date": publication_date.strip(),
+        "captured_snapshot_text": captured_snapshot_text,
     }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compute_record_content_hash(record: dict[str, Any]) -> str:
+    """Canonical versioned (v2) approval digest binding EVERY gate-driving metadata & evidence field."""
+    payload: dict[str, Any] = {"digest_version": APPROVAL_DIGEST_VERSION}
+    for field in APPROVAL_DIGEST_FIELDS:
+        val = record.get(field)
+        # Preserve exact JSON types (bool vs str vs int vs float vs None) so type tampering alters the digest.
+        if isinstance(val, (str, int, float, bool)) or val is None:
+            payload[field] = val
+        else:
+            payload[field] = str(val)
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -86,7 +141,7 @@ def is_valid_public_url(url: Any) -> bool:
         return False
     try:
         p = urlparse(u)
-        _ = p.port  # triggers ValueError on malformed port/IPv6 brackets
+        _ = p.port
         host = (p.hostname or "").strip().lower()
     except ValueError:
         return False
@@ -98,7 +153,6 @@ def is_valid_public_url(url: Any) -> bool:
     if any(host.endswith(f".{reserved}") for reserved in RESERVED_TEST_DOMAINS) or host.endswith(".local") or host.endswith(".internal"):
         return False
 
-    # Require a canonical non-empty post path (reject bare homepage URLs).
     path = (p.path or "").strip()
     if not path or path == "/":
         return False
@@ -267,11 +321,14 @@ def evaluate_for_publication(
     if has_pii_or_defam:
         reasons.append("CONTENT_PII_OR_SENSITIVE_DETECTED:" + ",".join(signals))
 
-    # Version-bound independent approval attestation check (C1).
+    # Version-bound independent approval attestation & full v2 digest check (C1 / COMM-004).
     attestation = record.get("approval_attestation")
     if not isinstance(attestation, dict):
         reasons.append("MISSING_APPROVAL_ATTESTATION")
     else:
+        if attestation.get("digest_version") != APPROVAL_DIGEST_VERSION:
+            reasons.append("UNSUPPORTED_ATTESTATION_DIGEST_VERSION")
+
         expected_hash = compute_record_content_hash(record)
         att_version = attestation.get("attestation_version")
         rec_approval_version = record.get("approval_version")
@@ -292,8 +349,21 @@ def evaluate_for_publication(
             reasons.append("MISSING_CAPTURED_PUBLISHER")
         if not is_valid_iso_timestamp(attestation.get("captured_at")):
             reasons.append("INVALID_CAPTURED_TIMESTAMP")
-        if not is_valid_sha256_hex(attestation.get("evidence_hash")):
+
+        att_ev_id = attestation.get("evidence_id")
+        if not isinstance(att_ev_id, str) or not att_ev_id.strip() or att_ev_id != record.get("evidence_id"):
+            reasons.append("MISSING_OR_MISMATCHED_EVIDENCE_ID")
+
+        att_ev_hash = attestation.get("evidence_hash")
+        if not is_valid_sha256_hex(att_ev_hash) or att_ev_hash != record.get("evidence_hash"):
             reasons.append("MISSING_VALID_EVIDENCE_HASH")
+
+        captured_by = attestation.get("evidence_captured_by")
+        if not isinstance(captured_by, str) or not captured_by.strip():
+            reasons.append("MISSING_EVIDENCE_VERIFIER")
+        elif isinstance(reviewer_id, str) and captured_by.strip() == reviewer_id.strip():
+            reasons.append("SELF_ATTESTED_EVIDENCE_FORBIDDEN")
+
         if attestation.get("reviewer_id") != reviewer_id or not is_valid_iso_timestamp(attestation.get("reviewed_at")):
             reasons.append("ATTESTATION_SIGNOFF_MISMATCH")
         if attestation.get("privacy_decision") != "PASS" or attestation.get("rights_decision") != "PASS":
@@ -315,11 +385,7 @@ def filter_retrieved_community(
     min_confidence: float = 0.0,
     today: date | None = None,
 ) -> list[dict[str, Any]]:
-    """Second-gate post-retrieval filter + canonical URL/dedup filtering (C1, H5, M2).
-
-    Enforces `require_published_namespace=True`, catches any malformed item
-    without raising, and deduplicates by canonical URL and dedup group.
-    """
+    """Second-gate post-retrieval filter + canonical URL/dedup filtering (C1, H5, M2)."""
     approved: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     seen_dedup_groups: set[str] = set()

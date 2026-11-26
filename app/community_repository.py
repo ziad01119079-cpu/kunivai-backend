@@ -1,16 +1,12 @@
-"""Isolated Firestore repository for Community Knowledge (H2, H3, H4, H6).
-
-Uses dedicated top-level Firestore collections completely separate from:
-- Official Knowledge (OPENAI_VECTOR_STORE_ID)
-- Private user schedules (users/{uid}/schedules)
-- Private user chat history (users/{uid}/chats)
+"""Isolated Firestore repository for Community Knowledge (H2, H3, H4, H6, COMM-004).
 
 Collections:
 - community_source_archives/{source_sha256} (bounded metadata pointer only; no multi-MiB raw body)
-- community_ingestion_jobs/{source_sha256}  (atomically claimed per SHA-256 via .create())
-- community_records/{community_id}          (create-only on ingest; version-checked transactional review)
+- community_ingestion_jobs/{source_sha256}  (lease-owned resumable SHA-256 job)
+- community_records/{community_id}          (create-only on ingest; transactional version-checked review)
 - community_audit_logs/{auto_id}            (written atomically alongside moderation state transitions)
 - community_revocations/{community_id}      (authoritative retraction markers checked across replicas)
+- community_evidence_artifacts/{evidence_id} (immutable server-verified source capture artifacts)
 """
 
 from __future__ import annotations
@@ -32,6 +28,7 @@ JOBS_COLLECTION = "community_ingestion_jobs"
 RECORDS_COLLECTION = "community_records"
 AUDIT_COLLECTION = "community_audit_logs"
 REVOCATIONS_COLLECTION = "community_revocations"
+EVIDENCE_COLLECTION = "community_evidence_artifacts"
 
 _CACHE_TTL_SECONDS = 30.0
 _published_cache: dict[str, Any] = {
@@ -41,11 +38,15 @@ _published_cache: dict[str, Any] = {
 
 
 class CommunityConcurrencyError(RuntimeError):
-    """Raised on optimistic-version mismatch during concurrent moderation."""
+    """Raised on optimistic-version or monotonic invariant violation during moderation."""
 
 
 class CommunityIdCollisionError(RuntimeError):
     """Raised when a distinct upload tries to overwrite an existing community_id."""
+
+
+class CommunityIngestionInProgressError(RuntimeError):
+    """Raised when an identical SHA-256 upload is currently actively leased by another worker."""
 
 
 def invalidate_community_cache() -> None:
@@ -83,6 +84,27 @@ async def _is_revoked_in_redis(community_id: str, approval_version: int) -> bool
         return True
 
 
+async def create_evidence_artifact_immutable(artifact_data: dict[str, Any]) -> dict[str, Any]:
+    """Create an immutable server-verified evidence artifact (create-only)."""
+    db = firestore_async.client()
+    evidence_id = str(artifact_data["evidence_id"])
+    doc_ref = db.collection(EVIDENCE_COLLECTION).document(evidence_id)
+    try:
+        await doc_ref.create(artifact_data)
+    except AlreadyExists as exc:
+        raise CommunityIdCollisionError(f"Evidence artifact '{evidence_id}' already exists.") from exc
+    return artifact_data
+
+
+async def get_evidence_artifact(evidence_id: str) -> dict[str, Any] | None:
+    """Load an immutable evidence artifact by evidence_id."""
+    db = firestore_async.client()
+    snap = await db.collection(EVIDENCE_COLLECTION).document(evidence_id).get()
+    if not snap.exists:
+        return None
+    return snap.to_dict()
+
+
 async def save_source_archive_idempotent(archive_data: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     """Persist bounded restricted archive metadata keyed by source_sha256."""
     db = firestore_async.client()
@@ -97,18 +119,63 @@ async def save_source_archive_idempotent(archive_data: dict[str, Any]) -> tuple[
         return False, existing or archive_data
 
 
-async def claim_ingestion_job_atomic(job_data: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
-    """Atomically claim the full SHA-256 ingestion job BEFORE any record writes (H4)."""
+async def claim_or_resume_ingestion_job(
+    job_data: dict[str, Any],
+    *,
+    now_epoch: float | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Atomically claim a new SHA-256 job, return completed duplicate, or reclaim a failed/expired job.
+
+    Returns `(outcome, job_dict)` where `outcome` is:
+    - `"claimed"`: new job claimed by this attempt
+    - `"resumed"`: previously FAILED or lease-expired CLAIMED job reclaimed for reconciliation
+    - `"duplicate_completed"`: job is already `QUARANTINED` with the full expected record set
+    Raises `CommunityIngestionInProgressError` if actively leased by another worker.
+    """
     db = firestore_async.client()
     sha256 = str(job_data["source_sha256"])
     doc_ref = db.collection(JOBS_COLLECTION).document(sha256)
-    try:
-        await doc_ref.create(job_data)
-        return True, job_data
-    except AlreadyExists:
-        snap = await doc_ref.get()
-        existing = snap.to_dict() if snap.exists else job_data
-        return False, existing or job_data
+    now = now_epoch if now_epoch is not None else time.time()
+
+    @firestore.async_transactional
+    async def _claim(transaction):
+        snap = await doc_ref.get(transaction=transaction)
+        if not snap.exists:
+            transaction.create(doc_ref, job_data)
+            return "claimed", dict(job_data)
+
+        existing = snap.to_dict() or {}
+        status = existing.get("status")
+        expected = existing.get("expected_record_ids") or []
+        written = existing.get("record_ids") or []
+        if (
+            status == "QUARANTINED"
+            and expected
+            and set(written) == set(expected)
+            and len(written) == len(expected)
+        ):
+            return "duplicate_completed", existing
+
+        lease_expires = float(existing.get("lease_expires_at") or 0.0)
+        if status == "CLAIMED" and lease_expires > now:
+            raise CommunityIngestionInProgressError(
+                f"Ingestion job for SHA '{sha256[:12]}' is currently in progress."
+            )
+
+        # Reclaim FAILED or lease-expired CLAIMED job for resumable reconciliation.
+        resumed = {
+            **existing,
+            "status": "CLAIMED",
+            "attempt_id": job_data.get("attempt_id"),
+            "lease_expires_at": job_data.get("lease_expires_at"),
+            "expected_record_ids": job_data.get("expected_record_ids") or expected,
+            "updated_at": job_data.get("updated_at"),
+            "error": None,
+        }
+        transaction.set(doc_ref, resumed)
+        return "resumed", resumed
+
+    return await _claim(db.transaction())
 
 
 async def update_ingestion_job(source_sha256: str, job_data: dict[str, Any]) -> dict[str, Any]:
@@ -132,14 +199,29 @@ async def get_ingestion_job(job_id: str) -> dict[str, Any] | None:
     return None
 
 
-async def create_community_record_strict(record_data: dict[str, Any]) -> dict[str, Any]:
-    """Create a quarantined community record without ever overwriting an existing ID (H4)."""
+async def create_community_record_strict(
+    record_data: dict[str, Any],
+    *,
+    allow_same_job_resume: bool = False,
+) -> dict[str, Any]:
+    """Create a quarantined community record without ever overwriting another upload's or published record."""
     db = firestore_async.client()
     community_id = str(record_data["community_id"])
     doc_ref = db.collection(RECORDS_COLLECTION).document(community_id)
     try:
         await doc_ref.create(record_data)
     except AlreadyExists as exc:
+        if allow_same_job_resume:
+            snap = await doc_ref.get()
+            existing = snap.to_dict() if snap.exists else None
+            if (
+                existing
+                and existing.get("source_sha256") == record_data.get("source_sha256")
+                and existing.get("ingestion_job_id") == record_data.get("ingestion_job_id")
+                and existing.get("moderation_status") != "APPROVED_FOR_COMMUNITY_PUBLICATION"
+                and existing.get("index_namespace") == "COMMUNITY_CANDIDATE_ONLY"
+            ):
+                return existing
         raise CommunityIdCollisionError(
             f"Community record '{community_id}' already exists and cannot be overwritten by ingestion."
         ) from exc
@@ -185,11 +267,7 @@ async def transition_community_record_atomic(
     audit_entry: dict[str, Any],
     retraction_marker: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Atomically validate version and commit moderation, audit, and revocation.
-
-    The read and version check MUST occur inside the Firestore transaction.
-    Concurrent writers are retried against the latest version.
-    """
+    """Atomically validate version, approval_version monotonicity, and commit moderation, audit, and revocation."""
     db = firestore_async.client()
     rec_ref = db.collection(RECORDS_COLLECTION).document(community_id)
     audit_ref = db.collection(AUDIT_COLLECTION).document()
@@ -221,23 +299,28 @@ async def transition_community_record_atomic(
             or audit_entry.get("new_status") != next_status
         ):
             raise CommunityConcurrencyError("Audit record does not match current state.")
+
+        # COMM-004 Finding 5: Enforce approval_version monotonicity on EVERY transition.
+        previous_approval = current.get("approval_version")
+        proposed_approval = new_record.get("approval_version")
+        if type(previous_approval) is not int or type(proposed_approval) is not int:
+            raise CommunityConcurrencyError("approval_version must be an integer on every transition.")
         if next_status == "APPROVED_FOR_COMMUNITY_PUBLICATION":
-            previous_approval = current.get("approval_version")
-            proposed_approval = new_record.get("approval_version")
-            if (
-                type(previous_approval) is not int
-                or type(proposed_approval) is not int
-                or proposed_approval != previous_approval + 1
-            ):
+            if proposed_approval != previous_approval + 1:
                 raise CommunityConcurrencyError(
                     "Every approval must increment the authoritative approval_version exactly once."
                 )
+        else:
+            if proposed_approval != previous_approval:
+                raise CommunityConcurrencyError(
+                    "Non-approval transitions must preserve approval_version unchanged."
+                )
+
         if old_status == "RETRACTED" and next_status != "RETRACTED":
             if (
                 next_status != "APPROVED_FOR_COMMUNITY_PUBLICATION"
                 or audit_entry.get("reapprove_after_retraction") is not True
-                or int(new_record.get("approval_version") or 0)
-                <= int(current.get("approval_version") or 0)
+                or proposed_approval <= previous_approval
             ):
                 raise CommunityConcurrencyError(
                     "Retracted records require explicitly audited, versioned reapproval."
@@ -247,9 +330,7 @@ async def transition_community_record_atomic(
         if retraction_marker is not None:
             if next_status != "RETRACTED" or retraction_marker.get("community_id") != community_id:
                 raise CommunityConcurrencyError("Revocation marker does not match record.")
-            if int(retraction_marker.get("revoked_approval_version") or 0) < max(
-                1, int(current.get("approval_version") or 0)
-            ):
+            if int(retraction_marker.get("revoked_approval_version") or 0) < max(1, previous_approval):
                 raise CommunityConcurrencyError("Revocation marker does not cover current approval.")
 
         transaction.set(rec_ref, new_record)
@@ -265,6 +346,7 @@ async def transition_community_record_atomic(
             community_id, int(retraction_marker.get("revoked_approval_version") or 0)
         )
     return result
+
 
 async def verify_record_not_revoked(community_id: str, approval_version: int) -> bool:
     """Authoritative revocation & version check against Redis + Firestore (H2).

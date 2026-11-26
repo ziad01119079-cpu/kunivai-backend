@@ -148,27 +148,53 @@ async def process_chat(
     # the current request out of raw_messages without text-based deduplication,
     # so legitimate repeated questions remain intact.
     # 2. Build token-limited context (returns chronological list).
-    # H6: Omit prior assistant messages whose cited Community sources were later retracted.
+    # H6 / COMM-004 Finding 2: When COMMUNITY_RAG_ENABLED=true, fail closed on:
+    # (a) annotated Community assistant messages whose cited record was later retracted, AND
+    # (b) legacy unannotated assistant messages lacking explicit non-Community provenance,
+    #     so unannotated historical Community answers cannot re-enter future prompts.
+    # When COMMUNITY_RAG_ENABLED=false, preserve exact legacy baseline history behavior.
     community_rag_enabled = bool(getattr(config, "COMMUNITY_RAG_ENABLED", False))
     safe_raw_messages = raw_messages
     if community_rag_enabled and raw_messages:
         filtered_history_rows = []
         for row in raw_messages:
-            row_citations = row.get("citations") if isinstance(row, dict) else None
-            if isinstance(row_citations, list):
-                community_refs = [
-                    {
-                        "community_id": c.get("community_id"),
-                        "approval_version": c.get("approval_version") or 0,
-                    }
-                    for c in row_citations
-                    if isinstance(c, dict) and c.get("source_kind") == "community_opinion" and c.get("community_id")
-                ]
-                if community_refs:
-                    still_valid = await verify_records_still_published(community_refs)
-                    if len(still_valid) != len(community_refs):
-                        continue
-            filtered_history_rows.append(row)
+            if not isinstance(row, dict) or row.get("isUser", True):
+                filtered_history_rows.append(row)
+                continue
+            row_citations = row.get("citations")
+            community_refs = [
+                {
+                    "community_id": c.get("community_id"),
+                    "approval_version": c.get("approval_version") or 0,
+                }
+                for c in (row_citations if isinstance(row_citations, list) else [])
+                if isinstance(c, dict) and c.get("source_kind") == "community_opinion" and c.get("community_id")
+            ]
+            if community_refs:
+                still_valid = await verify_records_still_published(community_refs)
+                if len(still_valid) != len(community_refs):
+                    continue
+                filtered_history_rows.append(row)
+                continue
+
+            # Explicit non-Community provenance (typed flag or verified official-only citations).
+            if row.get("history_source_kind") == "non_community":
+                filtered_history_rows.append(row)
+                continue
+            if isinstance(row_citations, list) and len(row_citations) > 0 and all(
+                isinstance(c, dict)
+                and c.get("source_kind") != "community_opinion"
+                and (
+                    c.get("type") == "file_citation"
+                    or (c.get("type") == "url_citation" and "ku.edu.kw" in str(c.get("url") or "").casefold())
+                )
+                for c in row_citations
+            ):
+                filtered_history_rows.append(row)
+                continue
+
+            # Legacy unannotated assistant message -> exclude fail-closed when Community RAG is enabled.
+            continue
         safe_raw_messages = filtered_history_rows
     history = build_history(safe_raw_messages, config.HISTORY_TOKEN_BUDGET)
 
@@ -569,7 +595,13 @@ async def process_chat(
                     accumulated_text.append(comm_text)
                     community_citations = community_citations_for_records(surviving)
                     community_source_versions = community_source_versions_for_records(surviving)
-                    yield "data: " + json.dumps({"type": "chunk", "content": comm_text}) + "\n\n"
+                    # COMM-004 Finding 1: Bind source versions to the chunk BEFORE emission/buffering.
+                    yield "data: " + json.dumps({
+                        "type": "chunk",
+                        "content": comm_text,
+                        "source_kind": "community_opinion",
+                        "community_source_versions": community_source_versions,
+                    }) + "\n\n"
                     done_payload = comm_done
         elif use_web_search:
             web_text: list[str] = []
@@ -748,10 +780,17 @@ async def process_chat(
                 unavailable=(community_result.status == "unavailable"),
             )
             accumulated_text.append(comm_section)
-            yield "data: " + json.dumps({"type": "chunk", "content": comm_section}) + "\n\n"
             if surviving:
                 community_citations = community_citations_for_records(surviving)
                 community_source_versions = community_source_versions_for_records(surviving)
+                yield "data: " + json.dumps({
+                    "type": "chunk",
+                    "content": comm_section,
+                    "source_kind": "community_opinion",
+                    "community_source_versions": community_source_versions,
+                }) + "\n\n"
+            else:
+                yield "data: " + json.dumps({"type": "chunk", "content": comm_section}) + "\n\n"
 
         if done_payload is None:
             provider_failed = True

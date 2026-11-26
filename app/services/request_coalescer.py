@@ -10,6 +10,11 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 
+from .community_replay_guard import (
+    extract_community_refs_from_payload,
+    filter_replay_sequence,
+)
+
 
 @dataclass
 class _RequestState:
@@ -18,6 +23,8 @@ class _RequestState:
     completed_at: float | None = None
     replay_bytes: int = 0
     replayable: bool = True
+    community_ids: set[str] = field(default_factory=set)
+    community_revoked: bool = False
 
 
 class RequestCoalescer:
@@ -41,6 +48,8 @@ class RequestCoalescer:
     ) -> AsyncIterator[str]:
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         now = time.monotonic()
+        replay_snapshot: tuple[str, ...] | None = None
+        replay_completed = False
         async with self._guard:
             self._prune(now)
             state = self._states.get(key)
@@ -53,15 +62,19 @@ class RequestCoalescer:
                 queue.put_nowait(self._replay_unavailable_event())
                 queue.put_nowait(None)
             elif state.completed_at is not None:
-                replay = tuple(state.events)
+                replay_snapshot = tuple(state.events)
+                replay_completed = True
                 self._states.move_to_end(key)
-                for event in replay:
-                    queue.put_nowait(event)
-                queue.put_nowait(None)
             else:
-                for event in state.events:
-                    queue.put_nowait(event)
+                replay_snapshot = tuple(state.events)
                 state.subscribers.add(queue)
+
+        if replay_snapshot is not None:
+            safe_replay = await filter_replay_sequence(replay_snapshot)
+            for event in safe_replay:
+                queue.put_nowait(event)
+            if replay_completed:
+                queue.put_nowait(None)
 
         try:
             while True:
@@ -84,6 +97,16 @@ class RequestCoalescer:
         try:
             async for event in factory():
                 encoded_size = len(event.encode("utf-8"))
+                # Track referenced Community IDs for proactive retraction invalidation (COMM-004).
+                if event.startswith("data:"):
+                    try:
+                        parsed = json.loads(event[5:].strip())
+                        if isinstance(parsed, dict):
+                            _, refs = extract_community_refs_from_payload(parsed)
+                            for ref in refs:
+                                state.community_ids.add(ref["community_id"])
+                    except ValueError:
+                        pass
                 if state.replayable and state.replay_bytes + encoded_size <= self._max_replay_bytes:
                     state.events.append(event)
                     state.replay_bytes += encoded_size
@@ -101,6 +124,15 @@ class RequestCoalescer:
                 if self._states.get(key) is state:
                     self._states.move_to_end(key)
                     self._prune(state.completed_at)
+
+    def invalidate_community_replay(self, community_id: str) -> int:
+        """Mark or evict completed local replay states referencing a retracted Community record."""
+        affected = 0
+        for state in self._states.values():
+            if community_id in state.community_ids:
+                state.community_revoked = True
+                affected += 1
+        return affected
 
     def _prune(self, now: float) -> None:
         expired = [
