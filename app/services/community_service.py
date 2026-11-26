@@ -743,6 +743,7 @@ async def apply_review_action(
         "previous_status": existing.get("moderation_status"),
         "new_status": merged.get("moderation_status"),
         "notes": request.notes,
+        "reapprove_after_retraction": request.reapprove_after_retraction,
         "retraction_reason": merged.get("retraction_reason"),
     }
 

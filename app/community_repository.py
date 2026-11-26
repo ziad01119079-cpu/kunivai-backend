@@ -21,6 +21,7 @@ from typing import Any
 
 from firebase_admin import firestore_async
 from google.api_core.exceptions import AlreadyExists
+from google.cloud import firestore
 
 from .services.coordination_runtime import distributed_enabled, get_redis_runtime
 
@@ -184,43 +185,86 @@ async def transition_community_record_atomic(
     audit_entry: dict[str, Any],
     retraction_marker: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Atomically commit record state transition + audit log + revocation marker (H2, H4).
+    """Atomically validate version and commit moderation, audit, and revocation.
 
-    Uses a Firestore transaction (when available on the client) or atomic batch
-    so an audit write failure prevents unaudited state changes, and optimistic
-    version checking prevents stale approvals from winning over retractions.
+    The read and version check MUST occur inside the Firestore transaction.
+    Concurrent writers are retried against the latest version.
     """
     db = firestore_async.client()
     rec_ref = db.collection(RECORDS_COLLECTION).document(community_id)
     audit_ref = db.collection(AUDIT_COLLECTION).document()
     rev_ref = db.collection(REVOCATIONS_COLLECTION).document(community_id)
 
-    snap = await rec_ref.get()
-    if not snap.exists:
-        raise KeyError(community_id)
-    current = snap.to_dict() or {}
-    current_version = int(current.get("record_version") or 1)
-    if current_version != expected_version:
-        raise CommunityConcurrencyError(
-            f"Concurrent modification detected for '{community_id}' "
-            f"(expected version {expected_version}, found {current_version})."
-        )
+    @firestore.async_transactional
+    async def _commit(transaction):
+        snap = await rec_ref.get(transaction=transaction)
+        if not snap.exists:
+            raise KeyError(community_id)
+        current = snap.to_dict() or {}
+        current_version = int(current.get("record_version") or 1)
+        if current_version != expected_version:
+            raise CommunityConcurrencyError(
+                f"Concurrent modification for '{community_id}': "
+                f"expected version {expected_version}, found {current_version}."
+            )
+        if new_record.get("community_id") != community_id:
+            raise CommunityConcurrencyError("Moderation cannot change community_id.")
+        if type(new_record.get("record_version")) is not int or new_record["record_version"] != current_version + 1:
+            raise CommunityConcurrencyError("record_version must increment by exactly one.")
+        old_status = current.get("moderation_status")
+        next_status = new_record.get("moderation_status")
+        if (
+            audit_entry.get("community_id") != community_id
+            or audit_entry.get("previous_version") != current_version
+            or audit_entry.get("new_version") != current_version + 1
+            or audit_entry.get("previous_status") != old_status
+            or audit_entry.get("new_status") != next_status
+        ):
+            raise CommunityConcurrencyError("Audit record does not match current state.")
+        if next_status == "APPROVED_FOR_COMMUNITY_PUBLICATION":
+            previous_approval = current.get("approval_version")
+            proposed_approval = new_record.get("approval_version")
+            if (
+                type(previous_approval) is not int
+                or type(proposed_approval) is not int
+                or proposed_approval != previous_approval + 1
+            ):
+                raise CommunityConcurrencyError(
+                    "Every approval must increment the authoritative approval_version exactly once."
+                )
+        if old_status == "RETRACTED" and next_status != "RETRACTED":
+            if (
+                next_status != "APPROVED_FOR_COMMUNITY_PUBLICATION"
+                or audit_entry.get("reapprove_after_retraction") is not True
+                or int(new_record.get("approval_version") or 0)
+                <= int(current.get("approval_version") or 0)
+            ):
+                raise CommunityConcurrencyError(
+                    "Retracted records require explicitly audited, versioned reapproval."
+                )
+        if next_status == "RETRACTED" and retraction_marker is None:
+            raise CommunityConcurrencyError("Retraction requires an authoritative marker.")
+        if retraction_marker is not None:
+            if next_status != "RETRACTED" or retraction_marker.get("community_id") != community_id:
+                raise CommunityConcurrencyError("Revocation marker does not match record.")
+            if int(retraction_marker.get("revoked_approval_version") or 0) < max(
+                1, int(current.get("approval_version") or 0)
+            ):
+                raise CommunityConcurrencyError("Revocation marker does not cover current approval.")
 
-    batch = db.batch()
-    batch.set(rec_ref, new_record)
-    batch.set(audit_ref, audit_entry)
-    if retraction_marker is not None:
-        batch.set(rev_ref, retraction_marker)
-    await batch.commit()
+        transaction.set(rec_ref, new_record)
+        transaction.create(audit_ref, audit_entry)
+        if retraction_marker is not None:
+            transaction.set(rev_ref, retraction_marker)
+        return dict(new_record)
 
+    result = await _commit(db.transaction())
     invalidate_community_cache()
     if retraction_marker is not None:
         await _publish_distributed_revocation(
-            community_id,
-            int(retraction_marker.get("revoked_approval_version") or 0),
+            community_id, int(retraction_marker.get("revoked_approval_version") or 0)
         )
-    return new_record
-
+    return result
 
 async def verify_record_not_revoked(community_id: str, approval_version: int) -> bool:
     """Authoritative revocation & version check against Redis + Firestore (H2).
